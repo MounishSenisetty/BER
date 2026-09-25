@@ -15,11 +15,11 @@ import argparse
 import os
 import pickle
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
 from .features import compute_features
+from .model import Ensemble
 from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
 from .postprocess import select
 from .utils import peak_memory_gb, CANDIDATE_HEADER, LOG, MATCHING_HEADER, fast_macro_f05, setup_logging, timer, write_id_lists
@@ -46,7 +46,7 @@ def main():
     if args.threshold is not None:
         rule["threshold"] = args.threshold
     LOG.info("Decision rule: mode=%s exclusive=%s threshold=%.3f", rule["mode"], rule["exclusive"], rule["threshold"])
-    boosters = [lgb.Booster(model_str=s) for s in bundle["boosters"]]
+    ens = Ensemble(bundle.get("models") or bundle["boosters"])
     feats = bundle["features"]
 
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=args.gt is not None)
@@ -54,10 +54,7 @@ def main():
     for ch in iter_chunks(split, cfg):
         with timer(f"  features + scoring for {len(ch.cand)} pairs"):
             X = compute_features(ch.idx, ch.rc, ch.cand, ch.mats, n_jobs=cfg.n_jobs)[feats]
-            p = np.zeros(len(X), dtype=np.float64)
-            for b in boosters:
-                p += b.predict(X)
-            p /= len(boosters)
+            p = ens.predict(X)
         s1_parts.append(ch.g_s1.astype(np.int32))
         rec_parts.append(ch.g_rec.astype(np.int32))
         p_parts.append(p.astype(np.float32))

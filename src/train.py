@@ -8,11 +8,12 @@ for a stratified sample of Source 1 entities (`--train-entities`, default 120k):
 candidate pair of a sampled entity is kept, so per-entity macro F0.5 can be evaluated honestly.
 
 Outputs (model-dir):
-    model_bundle.pkl          fold boosters + feature list + tuned decision rule (used by inference)
+    model_bundle.pkl          fold models + feature list + tuned decision rule (used by inference)
     cv_report.json            blocking recall / ceiling, OOF logloss/AUC, macro F0.5 (tuned + nested)
     feature_importance.csv    mean gain / split importance across folds
     threshold_curve.csv       macro F0.5 for every (mode, threshold) evaluated
     oof_predictions.tsv       OOF probability per sampled candidate pair (error analysis)
+    blocking_misses.tsv       sample of true pairs that candidate generation missed (with reason)
 """
 from __future__ import annotations
 
@@ -21,7 +22,6 @@ import json
 import os
 import pickle
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, roc_auc_score
@@ -29,6 +29,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 
 from .config import PipelineConfig
 from .features import compute_features
+from .model import resolve_backend, train_fold
 from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
@@ -69,6 +70,7 @@ def main():
     ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
+    ap.add_argument("--backend", choices=["auto", "xgboost", "lightgbm"], default=None)
     args = ap.parse_args()
     setup_logging()
     os.makedirs(args.model_dir, exist_ok=True)
@@ -82,6 +84,8 @@ def main():
         cfg.blocking.max_candidates_per_record = args.max_candidates
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
+    if args.backend:
+        cfg.model.backend = args.backend
 
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
     if split.truth is None:
@@ -94,6 +98,9 @@ def main():
 
     K = cfg.blocking.max_candidates_per_record
     found = np.zeros(len(n_true))
+    found_union = 0
+    rng = np.random.default_rng(cfg.model.seed)
+    misses = []
     rank_hist = np.zeros(K + 1)
     n_pairs, n_recs = 0, 0
     Xs, ys, s1s, recs = [], [], [], []
@@ -104,6 +111,19 @@ def main():
         rank_hist += np.bincount(ch.cand["cheap_rank"].to_numpy()[y], minlength=K + 1)[:K + 1]
         n_pairs += len(ch.cand)
         n_recs += len(ch.rc)
+        # diagnostics: were misses never generated, or generated and then capped away?
+        u_rec, u_s1 = ch.idx.last_union
+        yu = owner[ch.rec_rows[u_rec]] == ch.s1_rows[u_s1]
+        found_union += int(yu.sum())
+        own = owner[ch.rec_rows]
+        hit = np.zeros(len(ch.rc), bool)
+        hit[ch.cand["rec"].to_numpy()[y]] = True
+        hit_u = np.zeros(len(ch.rc), bool)
+        hit_u[u_rec[yu]] = True
+        miss = np.flatnonzero((own >= 0) & ~hit)
+        if len(miss):
+            pick = rng.choice(miss, size=min(150, len(miss)), replace=False)
+            misses += [(ch.rec_rows[i], own[i], "capped" if hit_u[i] else "not_generated") for i in pick]
         e = in_E[gs1]
         if not e.any():
             continue
@@ -128,11 +148,21 @@ def main():
     recall_at = {int(k): float(rank_hist[1:k + 1].sum() / max(total_true, 1)) for k in range(1, K + 1)}
     blk = {"pairs": int(n_pairs), "records": int(n_recs), "pairs_per_record": n_pairs / max(n_recs, 1),
            "true_pairs": int(total_true), "pair_recall": float(found.sum() / max(total_true, 1)),
+           "pair_recall_before_cap": float(found_union / max(total_true, 1)),
            "f05_ceiling_all": float(ceiling.mean()), "f05_ceiling_matched": float(ceiling[n_true > 0].mean()),
            "recall_at_cap": recall_at}
     LOG.info("Blocking report: %s", {k: (round(v, 4) if isinstance(v, float) else v) for k, v in blk.items()
                                      if k != "recall_at_cap"})
     LOG.info("Pair recall by per-record cap: %s", {k: round(v, 4) for k, v in recall_at.items()})
+    if misses:
+        mr, ms, why = map(np.array, zip(*misses))
+        S1, R = split.s1, split.rec
+        md = pd.DataFrame({"reason": why, "country": S1["country"].to_numpy()[ms],
+                           "s1_name": S1["name"].to_numpy()[ms], "s1_address": S1["address"].to_numpy()[ms],
+                           "rec_id": R["id"].to_numpy()[mr], "rec_name": R["name"].to_numpy()[mr],
+                           "rec_address": R["address"].to_numpy()[mr]})
+        md.to_csv(os.path.join(args.model_dir, "blocking_misses.tsv"), sep="\t", index=False)
+        LOG.info("Sampled blocking misses -> blocking_misses.tsv: %s", md["reason"].value_counts().to_dict())
 
     X = pd.concat(Xs, ignore_index=True)
     y = np.concatenate(ys)
@@ -151,21 +181,16 @@ def main():
     pair_fold = ent_fold[ent]
 
     oof = np.zeros(len(y), dtype=np.float64)
-    boosters, imps = [], []
-    params = dict(cfg.model.params, seed=cfg.model.seed, num_threads=os.cpu_count() or 1)
+    models, imps, best_iters = [], [], []
+    backend = resolve_backend(cfg.model.backend)
     for f in range(cfg.model.n_folds):
         tr, va = pair_fold != f, pair_fold == f
         with timer(f"Fold {f}: train {tr.sum()} / valid {va.sum()} pairs"):
-            dtr = lgb.Dataset(X[tr], y[tr], free_raw_data=True)
-            dva = lgb.Dataset(X[va], y[va], reference=dtr)
-            b = lgb.train(params, dtr, cfg.model.num_boost_round, valid_sets=[dva],
-                          callbacks=[lgb.early_stopping(cfg.model.early_stopping_rounds, verbose=False),
-                                     lgb.log_evaluation(0)])
-            oof[va] = b.predict(X[va], num_iteration=b.best_iteration)
-            LOG.info("  best_iter=%d  valid logloss=%.5f", b.best_iteration, log_loss(y[va], oof[va], labels=[0, 1]))
-        boosters.append(b)
-        imps.append(pd.DataFrame({"feature": X.columns, "gain": b.feature_importance("gain"),
-                                  "split": b.feature_importance("split")}))
+            m, oof[va], imp_f = train_fold(backend, cfg.model, X[tr], y[tr], X[va], y[va])
+            LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof[va], labels=[0, 1]))
+        models.append(m)
+        best_iters.append(int(m[2]))
+        imps.append(imp_f)
 
     imp = (pd.concat(imps).groupby("feature")[["gain", "split"]].mean()
            .sort_values("gain", ascending=False).reset_index())
@@ -217,11 +242,11 @@ def main():
         .to_csv(os.path.join(args.model_dir, "oof_predictions.tsv"), sep="\t", index=False)
     report = {"blocking": blk, "oof_logloss": oof_ll, "oof_auc": oof_auc, "decision": best,
               "oof_tuned": tuned, "nested_cv_macro_f05": nested_score, "nested_per_fold": nested,
-              "best_iterations": [b.best_iteration for b in boosters], "n_features": X.shape[1],
+              "best_iterations": best_iters, "backend": backend, "n_features": X.shape[1],
               "train_pairs": int(len(y)), "train_entities": int(in_E.sum())}
     with open(os.path.join(args.model_dir, "cv_report.json"), "w") as fh:
         json.dump(report, fh, indent=2, default=float)
-    bundle = {"boosters": [b.model_to_string(num_iteration=b.best_iteration) for b in boosters],
+    bundle = {"models": models,
               "features": list(X.columns), "decision": best, "config": cfg}
     with open(os.path.join(args.model_dir, "model_bundle.pkl"), "wb") as fh:
         pickle.dump(bundle, fh)

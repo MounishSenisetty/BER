@@ -20,7 +20,7 @@ import zipfile
 from importlib import metadata
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PACKAGES = ["numpy", "pandas", "scipy", "scikit-learn", "lightgbm", "rapidfuzz", "faiss-cpu", "joblib",
+PACKAGES = ["numpy", "pandas", "scipy", "scikit-learn", "lightgbm", "xgboost", "rapidfuzz", "faiss-cpu", "joblib",
             "jellyfish"]
 
 

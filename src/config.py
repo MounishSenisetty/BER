@@ -44,6 +44,7 @@ class ModelConfig:
     n_folds: int = 5
     seed: int = 42
     train_entities: int = 120_000        # S1 entities sampled for training (0 = all)
+    backend: str = "auto"                # auto = XGBoost on GPU if available, else LightGBM (CPU)
     num_boost_round: int = 2000
     early_stopping_rounds: int = 100
     params: dict = field(default_factory=lambda: {

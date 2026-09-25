@@ -368,5 +368,6 @@ class CountryIndex:
         keep = ((cand["cheap_rank"].to_numpy() <= cfg.max_candidates_per_record)
                 | ((addr_rank <= cfg.addr_keep) & (cand["cos_addr_c"].to_numpy() >= cfg.addr_keep_min_cos))
                 | (cand["key_rank"].to_numpy() <= cfg.key_keep))
+        self.last_union = (rec_arr, cand["s1"].to_numpy())      # pre-cap union (training diagnostics)
         cand = cand[keep].sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
         return cand.reset_index(drop=True), mats
