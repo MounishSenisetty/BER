@@ -3,7 +3,7 @@
     <team>_submission.zip
     ├── output/matching_results.tsv
     ├── output/candidate_pairs.tsv
-    ├── code/business_entity_resolution/{src/, scripts/, README.md, requirements.txt}
+    ├── code/business_entity_resolution/{src/, README.md, requirements.txt}
     └── Documentation_template.md
 
     python scripts/make_submission_zip.py --team myteam --out-dir output \
@@ -51,7 +51,8 @@ def main():
             if not os.path.exists(src):
                 raise SystemExit(f"missing {src}")
             z.write(src, f"output/{f}")
-        for folder in ("src", "scripts"):
+        # all code needed to regenerate the outputs lives in src/ (helper scripts are not needed)
+        for folder in ("src",):
             for root, _, files in os.walk(os.path.join(REPO, folder)):
                 for f in files:
                     if f.endswith(".py"):
