@@ -9,8 +9,12 @@ import unicodedata
 from functools import lru_cache
 from typing import List
 
-import jellyfish
 import pandas as pd
+
+try:
+    import jellyfish
+except ImportError:  # fall back to the built-in phonetic codes below
+    jellyfish = None
 
 LEGAL_SUFFIXES = {
     "inc", "incorporated", "llc", "llp", "lp", "ltd", "limited", "co", "corp", "corporation",
@@ -63,18 +67,50 @@ def tokens(s: str) -> List[str]:
     return [ABBREV.get(t, t) for t in clean(s).split()]
 
 
+_SDX = {c: d for d, cs in {"1": "bfpv", "2": "cgjkqsxz", "3": "dt", "4": "l", "5": "mn", "6": "r"}.items()
+        for c in cs}
+_RE_VOWELS = re.compile(r"(?<!^)[aeiouyhw]")
+_RE_REPEAT = re.compile(r"(.)\1+")
+
+
+def _soundex(tok: str) -> str:
+    tok = "".join(c for c in tok if "a" <= c <= "z")
+    if not tok:
+        return ""
+    out, prev = [tok[0].upper()], _SDX.get(tok[0], "")
+    for c in tok[1:]:
+        d = _SDX.get(c, "")
+        if d and d != prev:
+            out.append(d)
+        if c not in "hw":
+            prev = d
+    return ("".join(out) + "000")[:4]
+
+
+def _skeleton(tok: str) -> str:
+    """Crude metaphone stand-in: common digraphs, drop non-leading vowels, squeeze repeats."""
+    for a, b in (("ph", "f"), ("ck", "k"), ("sch", "sk"), ("sh", "x"), ("ch", "x"), ("th", "0"),
+                 ("gh", ""), ("kn", "n"), ("wr", "r"), ("q", "k"), ("z", "s"), ("c", "k"), ("v", "f")):
+        tok = tok.replace(a, b)
+    return _RE_REPEAT.sub(r"\1", _RE_VOWELS.sub("", tok)).upper()
+
+
 @lru_cache(maxsize=1_000_000)
 def metaphone(tok: str) -> str:
+    if not tok:
+        return ""
     try:
-        return jellyfish.metaphone(tok) if tok else ""
+        return jellyfish.metaphone(tok) if jellyfish else _skeleton(tok)
     except Exception:  # non-latin scripts etc.
         return tok
 
 
 @lru_cache(maxsize=1_000_000)
 def soundex(tok: str) -> str:
+    if not tok:
+        return ""
     try:
-        return jellyfish.soundex(tok) if tok else ""
+        return jellyfish.soundex(tok) if jellyfish else (_soundex(tok) or tok)
     except Exception:
         return tok
 

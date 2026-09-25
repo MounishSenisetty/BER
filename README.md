@@ -37,6 +37,23 @@ Column detection:
 - **Name column:** the column containing `name`.
 - **Address:** every remaining address-like column, concatenated.
 
+## Kaggle notebook
+
+The competition files live under `/kaggle/input/<dataset>/student_resource/dataset/{train,test}`
+(`train_source1.tsv`, …, `train_ground_truth.tsv`, `test_source1.tsv`, …). They are auto-detected.
+The input folder is read-only, so write models and outputs to `/kaggle/working`.
+
+```bash
+python scripts/eda.py --train-dir $TRAIN --test-dir $TEST                         # analyse the data first
+python -m src.train --data-dir $TRAIN --model-dir /kaggle/working/models
+python -m src.inference --data-dir $TEST --model-dir /kaggle/working/models --out-dir /kaggle/working/output
+python scripts/check_submission.py --data-dir $TEST --out-dir /kaggle/working/output
+```
+
+`jellyfish` and `datasketch` are optional:
+- without `jellyfish`, built-in phonetic codes are used;
+- without `datasketch`, the LSH blocker is skipped.
+
 ## Layout
 
 ```
@@ -50,6 +67,8 @@ src/pipeline.py     shared load -> normalise -> block -> featurise (train/infere
 src/train.py        entity-grouped stratified CV, OOF, feature importance, nested threshold tuning
 src/inference.py    produces output/candidate_pairs.tsv and output/matching_results.tsv
 scripts/make_synthetic_data.py   realistic noisy dataset generator for local testing
+scripts/eda.py                   dataset analysis + checks of the pipeline's assumptions
+scripts/check_submission.py      format checks for matching_results.tsv / candidate_pairs.tsv
 tests/test_core.py  metric edge cases, fast/exact metric agreement, decision logic
 ```
 
