@@ -204,7 +204,23 @@ def _build_faiss(D: np.ndarray, cfg: BlockingConfig, seed: int):
     index.train(D[rng.choice(N, size=min(N, nlist * 40), replace=False)])
     index.add(D)
     index.nprobe = cfg.faiss_nprobe
-    return index
+    return _maybe_gpu(index, cfg)
+
+
+def _maybe_gpu(index, cfg: BlockingConfig):
+    """Move an IVF index to the GPU(s) when a GPU build of FAISS sees one; otherwise keep the CPU
+    index. Results are the same search (same nprobe), only faster."""
+    if not getattr(cfg, "use_gpu", True) or not hasattr(faiss, "get_num_gpus"):
+        return index
+    try:
+        if faiss.get_num_gpus() < 1:
+            return index
+        gpu = faiss.index_cpu_to_all_gpus(index)
+        faiss.GpuParameterSpace().set_index_parameter(gpu, "nprobe", cfg.faiss_nprobe)
+        return gpu
+    except Exception as e:  # any GPU problem -> silently stay on CPU
+        LOG.warning("FAISS GPU unavailable (%s); using CPU index", e)
+        return index
 
 
 def _search(index, D_base: np.ndarray, Q: np.ndarray, k: int):

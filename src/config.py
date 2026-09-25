@@ -22,6 +22,7 @@ class BlockingConfig:
     svd_dim: int = 128
     svd_fit_rows: int = 300_000
     faiss_nprobe: int = 24
+    use_gpu: bool = True                 # use FAISS-GPU when installed and a GPU is visible
     exact_knn_below: int = 20_000        # smaller S1 partitions use exact (flat) search
     name_topk: int = 10                  # S1 neighbours per record, name space
     full_topk: int = 10                  # S1 neighbours per record, name+address space
