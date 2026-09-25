@@ -146,7 +146,13 @@ class Gen:
             elif legal == "Inc" and r.random() < 0.3:
                 legal = "Inc."
             name = f"{base} {legal}".strip()
-        if r.random() < 0.25:
+        u = r.random()
+        if u < 0.07:                                  # unrelated trade / brand name (only the address links it)
+            syl = ["zeta", "lyra", "novi", "quo", "zeph", "xylo", "lum", "kelo", "riza", "halo", "pyra", "avi", "ecto"]
+            name = "".join(r.sample(syl, r.choice([2, 3]))).capitalize()
+        elif u < 0.11:                                # acronym of the core name ("WEC", "MC")
+            name = "".join(w[0] for w in base.split()).upper()
+        elif u < 0.36:
             name = self.typo(name)
         if e["chain"] and r.random() < 0.4:
             name += f" #{r.randint(1, 2999):04d}"
@@ -205,10 +211,10 @@ def make_split(g: Gen, n_s1: int, countries):
     s1_ids = [f"S1-{i}" for i in r.sample(range(10**8, 10**9), n_s1)]
     recs, gt = [], {i: [] for i in s1_ids}
     for sid, e in zip(s1_ids, ents):
-        if r.random() < 0.3:
+        if r.random() < 0.056:                            # real data: 5.6% singletons, ~3.5 matches
             continue
         for vendor in (2, 3):
-            for _ in range(r.choice([0, 1, 1, 1, 2, 2, 3])):
+            for _ in range(r.choice([0, 1, 1, 2, 2, 2, 3])):
                 recs.append((vendor, e, sid))
     for _ in range(int(1.2 * n_s1)):                      # distractors not in Source 1
         c = r.choices(countries, weights=[0.55, 0.35, 0.10][:len(countries)])[0]

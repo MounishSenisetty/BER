@@ -28,11 +28,14 @@ class BlockingConfig:
 
     # --- sparse key index: rare tokens, token pairs, phonetic/address compound keys ---
     key_max_df: int = 100                # drop keys shared by more S1 rows than this
-    key_topk: int = 10
+    key_topk: int = 15
     key_hash_features: int = 2 ** 23
 
     # --- final budget: union re-ranked by a cheap score and capped per record ---
     max_candidates_per_record: int = 10
+    addr_keep: int = 2                   # + best-address candidates (trade names / acronyms) ...
+    addr_keep_min_cos: float = 0.5       # ... when their address cosine is at least this
+    key_keep: int = 2                    # + best key-overlap candidates
 
 
 @dataclass

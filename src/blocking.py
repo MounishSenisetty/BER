@@ -148,9 +148,12 @@ class CharSpace:
 # key index
 # ----------------------------------------------------------------------------------------------
 def make_keys(df: pd.DataFrame) -> List[List[str]]:
+    """Blocking keys per record. Name keys catch lexical overlap; address bigram and
+    acronym x address-number keys catch records whose name is a trade name or an acronym."""
     out = []
-    for ct, comp, ho, st, po, ft, mf in zip(df["core_toks"], df["compact"], df["house"], df["street"],
-                                             df["postal"], df["first_tok"], df["meta_first"]):
+    for ct, comp, ho, st, po, ft, mf, at, ini, nums in zip(
+            df["core_toks"], df["compact"], df["house"], df["street"], df["postal"], df["first_tok"],
+            df["meta_first"], df["addr_toks"], df["initials"], df["addr_nums"]):
         toks = list(dict.fromkeys(t for t in ct if len(t) >= 2 and not t.isdigit()))
         ks = ["t|" + t for t in toks]
         head = toks[:4]
@@ -167,6 +170,9 @@ def make_keys(df: pd.DataFrame) -> List[List[str]]:
             ks.append(f"mh|{mf}|{ho}")
         if st and ft:
             ks.append(f"sf|{st}|{ft}")
+        ks += [f"ab|{a}|{b}" for a, b in zip(at[:13], at[1:13]) if len(a) + len(b) >= 5]
+        acr = {x for x in (ini, comp if 2 <= len(comp) <= 5 and comp.isalpha() else "") if x}
+        ks += [f"ac|{x}|{n}" for x in acr for n in nums[:3]]
         out.append(ks)
     return out
 
@@ -191,7 +197,7 @@ def _build_faiss(D: np.ndarray, cfg: BlockingConfig, seed: int):
         index = faiss.IndexFlatIP(d)
         index.add(D)
         return index
-    nlist = int(min(65536, max(64, 4 * math.sqrt(N))))
+    nlist = int(min(65536, max(16, min(4 * math.sqrt(N), N / 50))))
     quantizer = faiss.IndexFlatIP(d)
     index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
     rng = np.random.default_rng(seed)
@@ -220,6 +226,18 @@ def _search(index, D_base: np.ndarray, Q: np.ndarray, k: int):
     ids = ids.ravel()
     ok = ids >= 0
     return rows[ok], ids[ok].astype(np.int64), rank[ok]
+
+
+def _rank_within(g: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """1-based descending rank of x within groups g."""
+    order = np.lexsort((-x, g))
+    gs = g[order]
+    start = np.r_[True, gs[1:] != gs[:-1]]
+    first = np.flatnonzero(start)
+    pos = np.arange(len(g)) - first[np.cumsum(start) - 1]
+    rank = np.empty(len(g), dtype=np.int64)
+    rank[order] = pos + 1
+    return rank
 
 
 class CountryIndex:
@@ -322,10 +340,17 @@ class CountryIndex:
         cand["cos_name_d"] = dense_rowdot(self.name_D, name_D, ia, ib)
         cand["cos_full_d"] = dense_rowdot(self.full_D, full_D, ia, ib)
         cand["key_score"] = rowwise_dot(self.key_W, Q, ia, ib)
-        cand["cheap"] = (0.4 * cand["cos_name_d"] + 0.4 * cand["cos_full_d"]
-                         + 0.2 * np.tanh(cand["key_score"] / 10.0) + 0.01 * cand["n_blockers"]).astype(np.float32)
+        cand["cos_addr_c"] = rowwise_dot(self.addr_X, addr_X, ia, ib)
+        cand["cheap"] = (0.3 * cand["cos_name_d"] + 0.3 * cand["cos_full_d"] + 0.25 * cand["cos_addr_c"]
+                         + 0.15 * np.tanh(cand["key_score"] / 10.0) + 0.01 * cand["n_blockers"]).astype(np.float32)
 
-        cand = cand.sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
-        cand["cheap_rank"] = (cand.groupby("rec").cumcount() + 1).astype(np.int16)
-        cand = cand[cand["cheap_rank"] <= cfg.max_candidates_per_record].reset_index(drop=True)
-        return cand, mats
+        # keep the top-K by the cheap score, plus a few address / key specialists per record so that
+        # trade names and acronyms (name says nothing, address says everything) are not capped away
+        rec_arr = cand["rec"].to_numpy()
+        cand["cheap_rank"] = _rank_within(rec_arr, cand["cheap"].to_numpy()).astype(np.int16)
+        addr_rank = _rank_within(rec_arr, cand["cos_addr_c"].to_numpy())
+        keep = ((cand["cheap_rank"].to_numpy() <= cfg.max_candidates_per_record)
+                | ((addr_rank <= cfg.addr_keep) & (cand["cos_addr_c"].to_numpy() >= cfg.addr_keep_min_cos))
+                | (cand["key_rank"].to_numpy() <= cfg.key_keep))
+        cand = cand[keep].sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
+        return cand.reset_index(drop=True), mats

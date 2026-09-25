@@ -135,7 +135,8 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     # ---- exact sparse tf-idf cosines ------------------------------------------------------
     F["cos_name_c"] = rowwise_dot(idx.name_X, mats.name_X, ia, ib)
     F["cos_full_c"] = rowwise_dot(idx.full_X, mats.full_X, ia, ib)
-    F["cos_addr_c"] = rowwise_dot(idx.addr_X, mats.addr_X, ia, ib)
+    F["cos_addr_c"] = cand["cos_addr_c"].to_numpy() if "cos_addr_c" in cand else \
+        rowwise_dot(idx.addr_X, mats.addr_X, ia, ib)
 
     # ---- token-set overlaps (chunk-local incidence, global idf) ---------------------------
     u1, ja = np.unique(ia, return_inverse=True)

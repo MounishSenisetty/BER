@@ -42,7 +42,7 @@ LEGAL_SUFFIXES = {
     "company", "plc", "pllc", "pc", "pa", "dba", "the", "and", "of",
     # India (incl. transliterated Devanagari forms produced by translit())
     "pvt", "private", "public", "opc", "praivet", "privet", "limited", "limitd", "elelpi",
-    "kampani", "pablik", "ltda", "p", "elaelapi", "elelapi", "limitd", "praivhet",
+    "kampani", "pablik", "ltda", "p", "td", "lt", "pvtltd", "elaelapi", "elelapi", "limitd", "praivhet",
     # France
     "sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scp", "scop", "selarl", "selas", "sca",
     "gie", "eirl", "ei", "cie", "compagnie", "societe", "et", "de", "du", "des", "la", "le", "les",
@@ -50,6 +50,30 @@ LEGAL_SUFFIXES = {
     "gmbh", "ag", "bv", "nv", "pty", "srl", "spa", "ab", "oy", "kg",
 }
 WEB_TOKENS = {"www", "http", "https"}
+HONORIFICS = {"smt", "shrimati", "mr", "mrs", "kumari", "sh"}
+_NOT_LEGAL = {"privacy", "privilege", "privileged", "privy", "limitless", "corporate", "companion", "companions"}
+_LEGAL_LONG = ("private", "limited", "incorporated", "corporation", "company", "partnership")
+
+
+@lru_cache(maxsize=1_000_000)
+def is_legal(t: str) -> bool:
+    """Legal-form token, tolerating the misspellings seen in the data (Privhea, Liimted, Limitend)."""
+    if t in LEGAL_SUFFIXES:
+        return True
+    if len(t) < 6 or not t.isalpha() or t in _NOT_LEGAL:
+        return False
+    if t.startswith(("priv", "limit", "lmit", "incorp", "corpor")):
+        return True
+    from rapidfuzz.distance import Levenshtein
+    k = 1 if len(t) < 8 else 2
+    return any(Levenshtein.distance(t, w, score_cutoff=k) <= k for w in _LEGAL_LONG)
+
+
+_RE_LEET = re.compile(r"(?<=[A-Za-z])[01](?=[A-Za-z])")
+
+
+def _unleet(m) -> str:
+    return "o" if m.group(0) == "0" else "l"
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
 ABBREV_COMMON = {
@@ -364,10 +388,12 @@ def _india_phonetic(tok: str) -> str:
 
 def _prep_one(name: str, address: str, country: str):
     ckey = country_key(country)
-    nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
+    nt = [t for t in tokens(_RE_LEET.sub(_unleet, name or ""), ckey) if t not in WEB_TOKENS]
     if ckey == "india":
         nt = [_india_phonetic(t) for t in nt]
-    ct = [t for t in nt if t not in LEGAL_SUFFIXES] or nt
+    if len(nt) > 2 and nt[0] == "m" and nt[1] == "s":            # "M/s Foo Traders"
+        nt = nt[2:]
+    ct = [t for t in nt if not is_legal(t) and t not in HONORIFICS] or nt
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)
