@@ -1,82 +1,50 @@
-"""High-recall blocking: union of complementary candidate generators, then a cheap re-rank + cap.
+"""Scalable blocking: per-country Source 1 indexes queried by chunks of Source 2/3 records.
 
-Direction: every Source 2 / Source 3 record *queries* the Source 1 reference set. This is the
-natural direction because a noisy record belongs to at most one S1 entity, while an S1 entity
-may own many records.
+Direction: every S2/S3 record *queries* the Source 1 index of its country. A noisy record belongs
+to at most one S1 entity, while an S1 entity may own many records.
 
-Generators (each emits (rec_idx, s1_idx) pairs + a flag column used later as a feature):
-  1. TF-IDF char n-gram kNN on the core name           (typos, abbreviations, word order)
-  2. TF-IDF char n-gram kNN on core name + address      (disambiguates chains / generic names)
-  3. Rare-name-token inverted index                     (exact token overlap, IDF-capped buckets)
-  4. Phonetic compound keys: metaphone(first token) x {postal, house no.}, soundex x postal
-  5. Address compound keys: house no. x street token, postal x first name token
-  6. MinHash LSH over name+address token sets           (datasketch)
+For each country partition the Source 1 side builds
+  * hashed char 3-gram TF-IDF spaces (core name / name+address / address), idf fitted on S1
+  * dense vectors = TruncatedSVD(TF-IDF) -> two FAISS inner-product indexes (name, name+address)
+  * a sparse key index over rare tokens, token pairs and phonetic / address compound keys
+    (keys shared by more than `key_max_df` S1 rows are dropped as unselective)
 
-Run standalone to export candidate_pairs.tsv:
-    python -m src.blocking --data-dir data/test --out output/candidate_pairs.tsv
+Each record chunk is searched with the three generators (dense-name kNN, dense-full kNN, key
+overlap); the union is scored with a cheap similarity, and the top `max_candidates_per_record`
+per record are kept. That capped set is exactly what the classifier scores and what
+candidate_pairs.tsv contains.
 """
 from __future__ import annotations
 
-import argparse
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.feature_extraction.text import TfidfVectorizer
+from joblib import Parallel, delayed
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction import FeatureHasher
+from sklearn.feature_extraction.text import HashingVectorizer
 
 from .config import BlockingConfig
-from .utils import LOG, timer
+from .utils import LOG
 
-BLOCKERS = ["b_knn_name", "b_knn_full", "b_token", "b_phon", "b_addr", "b_lsh"]
+try:
+    import faiss
+except ImportError:  # small data still works with brute-force numpy search
+    faiss = None
 
-
-# ----------------------------------------------------------------------------------------
-# Vector spaces (shared with feature extraction)
-# ----------------------------------------------------------------------------------------
-@dataclass
-class Spaces:
-    name_c1: sp.csr_matrix   # char n-gram tfidf of core names, S1
-    name_c2: sp.csr_matrix   # ... records
-    full_c1: sp.csr_matrix
-    full_c2: sp.csr_matrix
-    addr_c1: sp.csr_matrix
-    addr_c2: sp.csr_matrix
-    name_w1: sp.csr_matrix   # word tfidf of core names
-    name_w2: sp.csr_matrix
-    addr_w1: sp.csr_matrix
-    addr_w2: sp.csr_matrix
+BLOCKERS = ["b_knn_name", "b_knn_full", "b_key"]
 
 
-def _fit_pair(a: List[str], b: List[str], **kw):
-    vec = TfidfVectorizer(dtype=np.float32, sublinear_tf=True, **kw)
-    try:
-        vec.fit(a + b)
-    except ValueError:  # empty vocabulary (e.g. no addresses at all)
-        z1 = sp.csr_matrix((len(a), 1), dtype=np.float32)
-        z2 = sp.csr_matrix((len(b), 1), dtype=np.float32)
-        return z1, z2
-    return vec.transform(a).tocsr(), vec.transform(b).tocsr()
-
-
-def build_spaces(s1: pd.DataFrame, rec: pd.DataFrame, cfg: BlockingConfig) -> Spaces:
-    """Fit TF-IDF on S1 + records of the *current* split (unsupervised, no labels)."""
-    with timer("Fitting TF-IDF spaces"):
-        char_kw = dict(analyzer="char_wb", ngram_range=tuple(cfg.ngram_range), min_df=2,
-                       max_df=cfg.tfidf_max_df)
-        word_kw = dict(analyzer="word", token_pattern=r"(?u)\b\w+\b", min_df=1)
-        n1, n2 = _fit_pair(s1["core"].tolist(), rec["core"].tolist(), **char_kw)
-        f1, f2 = _fit_pair(s1["full"].tolist(), rec["full"].tolist(), **char_kw)
-        a1, a2 = _fit_pair(s1["addr_n"].tolist(), rec["addr_n"].tolist(), **char_kw)
-        w1, w2 = _fit_pair(s1["core"].tolist(), rec["core"].tolist(), **word_kw)
-        aw1, aw2 = _fit_pair(s1["addr_n"].tolist(), rec["addr_n"].tolist(), **word_kw)
-    return Spaces(n1, n2, f1, f2, a1, a2, w1, w2, aw1, aw2)
-
-
+# ----------------------------------------------------------------------------------------------
+# sparse / dense helpers
+# ----------------------------------------------------------------------------------------------
 def rowwise_dot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray,
-                chunk: int = 500_000) -> np.ndarray:
-    """dot(A[ia[k]], B[ib[k]]) for every k -- cosine if rows are L2-normalised."""
+                chunk: int = 1_000_000) -> np.ndarray:
+    """dot(A[ia[k]], B[ib[k]]) for every k (cosine when rows are L2-normalised)."""
     out = np.empty(len(ia), dtype=np.float32)
     for s in range(0, len(ia), chunk):
         e = min(s + chunk, len(ia))
@@ -84,201 +52,280 @@ def rowwise_dot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarr
     return out
 
 
-# ----------------------------------------------------------------------------------------
-# Generators
-# ----------------------------------------------------------------------------------------
-def sparse_topk(Q: sp.csr_matrix, R: sp.csr_matrix, k: int, min_sim: float, chunk: int) -> pd.DataFrame:
-    """Top-k rows of R for each row of Q by cosine similarity, via chunked sparse matmul."""
-    RT = R.T.tocsr()
-    qi, ri, rank = [], [], []
-    for start in range(0, Q.shape[0], chunk):
-        S = (Q[start:start + chunk] @ RT).tocsr()
-        for i in range(S.shape[0]):
-            lo, hi = S.indptr[i], S.indptr[i + 1]
-            if hi == lo:
-                continue
-            d = S.data[lo:hi]
-            c = S.indices[lo:hi]
-            keep = d >= min_sim
-            d, c = d[keep], c[keep]
-            if len(d) > k:
-                sel = np.argpartition(-d, k - 1)[:k]
-                d, c = d[sel], c[sel]
-            order = np.argsort(-d, kind="stable")
-            qi.append(np.full(len(order), start + i, dtype=np.int64))
-            ri.append(c[order].astype(np.int64))
-            rank.append(np.arange(1, len(order) + 1, dtype=np.int32))
-    if not qi:
-        return pd.DataFrame({"rec_idx": [], "s1_idx": [], "rank": []}, dtype=np.int64)
-    return pd.DataFrame({"rec_idx": np.concatenate(qi), "s1_idx": np.concatenate(ri),
-                         "rank": np.concatenate(rank)})
-
-
-def pairs_from_keys(k1: pd.DataFrame, k2: pd.DataFrame, max_bucket: int) -> pd.DataFrame:
-    """Equi-join on a blocking key. k1: (s1_idx, key), k2: (rec_idx, key).
-    Keys whose S1 bucket exceeds `max_bucket` are dropped (too unselective)."""
-    k1 = k1[k1["key"] != ""].drop_duplicates()
-    k2 = k2[k2["key"] != ""].drop_duplicates()
-    size = k1.groupby("key").size()
-    k1 = k1[k1["key"].isin(size.index[size <= max_bucket])]
-    m = k2.merge(k1, on="key", how="inner")
-    return m[["rec_idx", "s1_idx"]].drop_duplicates()
-
-
-def _explode(idx_name: str, values: List[List[str]]) -> pd.DataFrame:
-    lens = np.fromiter((len(v) for v in values), dtype=np.int64, count=len(values))
-    return pd.DataFrame({idx_name: np.repeat(np.arange(len(values)), lens),
-                         "key": [t for v in values for t in v]})
-
-
-def _compound_keys(df: pd.DataFrame, kind: str) -> List[List[str]]:
-    out = []
-    if kind == "phon":
-        for mf, sx, po, ho in zip(df["meta_first"], df["sdx_first"], df["postal"], df["house"]):
-            ks = []
-            if mf and po:
-                ks.append(f"mp|{mf}|{po}")
-            if mf and ho:
-                ks.append(f"mh|{mf}|{ho}")
-            if sx and po:
-                ks.append(f"sp|{sx}|{po}")
-            out.append(ks)
-    elif kind == "addr":
-        for ho, st, po, ft in zip(df["house"], df["street"], df["postal"], df["first_tok"]):
-            ks = []
-            if ho and st:
-                ks.append(f"hs|{ho}|{st}")
-            if po and ft:
-                ks.append(f"pf|{po}|{ft}")
-            out.append(ks)
+def dense_rowdot(A: np.ndarray, B: np.ndarray, ia: np.ndarray, ib: np.ndarray,
+                 chunk: int = 65_536) -> np.ndarray:
+    out = np.empty(len(ia), dtype=np.float32)
+    for s in range(0, len(ia), chunk):
+        e = min(s + chunk, len(ia))
+        out[s:e] = np.einsum("ij,ij->i", A[ia[s:e]], B[ib[s:e]])
     return out
 
 
-def _name_tokens(df: pd.DataFrame) -> List[List[str]]:
-    return [sorted({t for t in toks if len(t) >= 2}) for toks in df["core_toks"]]
+def csr_topk(S: sp.csr_matrix, k: int):
+    """Vectorised per-row top-k of a CSR matrix -> (row, col, value, rank)."""
+    S = S.tocsr()
+    rows = np.repeat(np.arange(S.shape[0], dtype=np.int64), np.diff(S.indptr))
+    order = np.lexsort((-S.data, rows))
+    rows_s = rows[order]
+    rank = np.arange(len(order), dtype=np.int64) - S.indptr[rows_s]
+    keep = rank < k
+    return rows_s[keep], S.indices[order][keep].astype(np.int64), S.data[order][keep], (rank[keep] + 1)
 
 
-def lsh_pairs(s1: pd.DataFrame, rec: pd.DataFrame, cfg: BlockingConfig) -> pd.DataFrame:
-    try:
-        from datasketch import MinHash, MinHashLSH
-    except ImportError:
-        LOG.warning("datasketch not installed -> skipping LSH blocker")
-        return pd.DataFrame({"rec_idx": [], "s1_idx": []}, dtype=np.int64)
-
-    def sets(df):
-        return [[t.encode("utf8") for t in set(a) | set(b)] or [b"__empty__"]
-                for a, b in zip(df["core_toks"], df["addr_toks"])]
-
-    lsh = MinHashLSH(threshold=cfg.lsh_threshold, num_perm=cfg.lsh_num_perm)
-    mh1 = MinHash.bulk(sets(s1), num_perm=cfg.lsh_num_perm)
-    with lsh.insertion_session() as session:
-        for i, m in enumerate(mh1):
-            session.insert(i, m, check_duplication=False)
-    mh2 = MinHash.bulk(sets(rec), num_perm=cfg.lsh_num_perm)
-    ri, si = [], []
-    for j, m in enumerate(mh2):
-        for i in lsh.query(m):
-            ri.append(j)
-            si.append(i)
-    return pd.DataFrame({"rec_idx": np.asarray(ri, dtype=np.int64), "s1_idx": np.asarray(si, dtype=np.int64)})
+def _l2_normalize_rows(X: sp.csr_matrix) -> sp.csr_matrix:
+    sq = np.asarray(X.multiply(X).sum(axis=1)).ravel()
+    inv = np.where(sq > 0, 1.0 / np.sqrt(np.maximum(sq, 1e-12)), 0.0).astype(np.float32)
+    return sp.diags(inv).dot(X).tocsr()
 
 
-# ----------------------------------------------------------------------------------------
-# Orchestration
-# ----------------------------------------------------------------------------------------
-def generate_candidates(s1: pd.DataFrame, rec: pd.DataFrame, spaces: Spaces,
-                        cfg: BlockingConfig) -> pd.DataFrame:
-    """Returns one row per candidate (rec_idx, s1_idx) with blocker flags, kNN ranks and a
-    cheap similarity score. Output is capped at cfg.max_candidates_per_record per record."""
-    parts: Dict[str, pd.DataFrame] = {}
-    with timer("Blocking: TF-IDF kNN (name)"):
-        knn_n = sparse_topk(spaces.name_c2, spaces.name_c1, cfg.name_topk, cfg.min_sim, cfg.chunk_size)
-    with timer("Blocking: TF-IDF kNN (name+address)"):
-        knn_f = sparse_topk(spaces.full_c2, spaces.full_c1, cfg.full_topk, cfg.min_sim, cfg.chunk_size)
-    with timer("Blocking: inverted indexes"):
-        parts["b_token"] = pairs_from_keys(_explode("s1_idx", _name_tokens(s1)),
-                                           _explode("rec_idx", _name_tokens(rec)),
-                                           cfg.token_max_bucket)
-        parts["b_phon"] = pairs_from_keys(_explode("s1_idx", _compound_keys(s1, "phon")),
-                                          _explode("rec_idx", _compound_keys(rec, "phon")),
-                                          cfg.key_max_bucket)
-        parts["b_addr"] = pairs_from_keys(_explode("s1_idx", _compound_keys(s1, "addr")),
-                                          _explode("rec_idx", _compound_keys(rec, "addr")),
-                                          cfg.key_max_bucket)
-    if cfg.use_lsh:
-        with timer("Blocking: MinHash LSH"):
-            parts["b_lsh"] = lsh_pairs(s1, rec, cfg)
-
-    frames = [knn_n.rename(columns={"rank": "knn_name_rank"}).assign(b_knn_name=1),
-              knn_f.rename(columns={"rank": "knn_full_rank"}).assign(b_knn_full=1)]
-    for name, df in parts.items():
-        LOG.info("  %-7s -> %d raw pairs", name, len(df))
-        frames.append(df.assign(**{name: 1}))
-    LOG.info("  knn_name-> %d raw pairs | knn_full -> %d raw pairs", len(knn_n), len(knn_f))
-
-    allp = pd.concat(frames, ignore_index=True)
-    agg = {c: "max" for c in BLOCKERS if c in allp.columns}
-    agg.update({"knn_name_rank": "min", "knn_full_rank": "min"})
-    cand = allp.groupby(["rec_idx", "s1_idx"], sort=False).agg(agg).reset_index()
-    for c in BLOCKERS:
-        cand[c] = cand[c].fillna(0).astype(np.int8) if c in cand.columns else np.int8(0)
-    cand["knn_name_rank"] = cand["knn_name_rank"].fillna(cfg.name_topk + 1).astype(np.int32)
-    cand["knn_full_rank"] = cand["knn_full_rank"].fillna(cfg.full_topk + 1).astype(np.int32)
-    cand["n_blockers"] = cand[BLOCKERS].sum(axis=1).astype(np.int8)
-
-    ia, ib = cand["s1_idx"].to_numpy(), cand["rec_idx"].to_numpy()
-    cand["cos_name_c"] = rowwise_dot(spaces.name_c1, spaces.name_c2, ia, ib)
-    cand["cos_full_c"] = rowwise_dot(spaces.full_c1, spaces.full_c2, ia, ib)
-    cand["cheap"] = (0.55 * cand["cos_name_c"] + 0.45 * cand["cos_full_c"]
-                     + 0.02 * cand["n_blockers"]).astype(np.float32)
-
-    before = len(cand)
-    cand = cand.sort_values(["rec_idx", "cheap"], ascending=[True, False], kind="stable")
-    cand["cheap_rank"] = cand.groupby("rec_idx").cumcount().astype(np.int32) + 1
-    cand = cand[cand["cheap_rank"] <= cfg.max_candidates_per_record].reset_index(drop=True)
-    LOG.info("Candidates: %d unioned -> %d after cap (%.1f / record, %d records, %d S1 entities)",
-             before, len(cand), len(cand) / max(len(rec), 1), len(rec), len(s1))
-    return cand
+def _n_jobs(n: int) -> int:
+    import os
+    return (os.cpu_count() or 1) if n is None or n < 1 else n
 
 
-def attach_ids(cand: pd.DataFrame, s1: pd.DataFrame, rec: pd.DataFrame) -> pd.DataFrame:
-    cand = cand.copy()
-    cand["source1_id"] = s1["id"].to_numpy()[cand["s1_idx"].to_numpy()]
-    cand["candidate_id"] = rec["id"].to_numpy()[cand["rec_idx"].to_numpy()]
-    cand["candidate_source"] = rec["source"].to_numpy()[cand["rec_idx"].to_numpy()]
-    return cand
+# ----------------------------------------------------------------------------------------------
+# TF-IDF + SVD space
+# ----------------------------------------------------------------------------------------------
+class CharSpace:
+    """Hashed char n-gram TF-IDF (idf fitted on S1) with an optional dense SVD projection."""
+
+    def __init__(self, cfg: BlockingConfig, dense: bool, n_jobs: int = -1):
+        self.cfg, self.dense, self.n_jobs = cfg, dense, _n_jobs(n_jobs)
+        self.hv = HashingVectorizer(analyzer="char_wb", ngram_range=tuple(cfg.ngram_range),
+                                    n_features=cfg.hash_features, alternate_sign=False, norm=None,
+                                    dtype=np.float32)
+
+    def _counts(self, texts: List[str]) -> sp.csr_matrix:
+        if len(texts) < 100_000 or self.n_jobs == 1:
+            return self.hv.transform(texts).tocsr()
+        step = int(math.ceil(len(texts) / self.n_jobs))
+        parts = Parallel(n_jobs=self.n_jobs)(delayed(self.hv.transform)(texts[i:i + step])
+                                             for i in range(0, len(texts), step))
+        return sp.vstack(parts).tocsr()
+
+    def _weight(self, X: sp.csr_matrix) -> sp.csr_matrix:
+        X = X.copy()
+        X.data = (1.0 + np.log(X.data)) * self.idf[X.indices]
+        return _l2_normalize_rows(X)
+
+    def _project(self, Xw: sp.csr_matrix) -> np.ndarray:
+        m = self.colmap[Xw.indices]
+        keep = m >= 0
+        rows = np.repeat(np.arange(Xw.shape[0]), np.diff(Xw.indptr))
+        indptr = np.r_[0, np.cumsum(np.bincount(rows[keep], minlength=Xw.shape[0]))]
+        Xa = sp.csr_matrix((Xw.data[keep], m[keep], indptr), shape=(Xw.shape[0], len(self.active)))
+        D = np.asarray(Xa @ self.comp_T, dtype=np.float32)
+        nrm = np.linalg.norm(D, axis=1, keepdims=True)
+        return D / np.maximum(nrm, 1e-8)
+
+    def fit_transform(self, texts: List[str], seed: int = 0):
+        X = self._counts(texts)
+        N = X.shape[0]
+        df = np.bincount(X.indices, minlength=X.shape[1]).astype(np.float32)
+        self.idf = (np.log((N + 1) / (df + 1)) + 1).astype(np.float32)
+        Xw = self._weight(X)
+        D = None
+        if self.dense:
+            self.active = np.flatnonzero(df > 0)
+            self.colmap = np.full(X.shape[1], -1, dtype=np.int64)
+            self.colmap[self.active] = np.arange(len(self.active))
+            rng = np.random.default_rng(seed)
+            rows = rng.choice(N, size=min(N, self.cfg.svd_fit_rows), replace=False)
+            Xs = Xw[rows][:, self.active]
+            dim = int(max(2, min(self.cfg.svd_dim, Xs.shape[1] - 1, Xs.shape[0] - 1)))
+            svd = TruncatedSVD(n_components=dim, algorithm="randomized", n_iter=4, random_state=seed)
+            svd.fit(Xs)
+            self.comp_T = svd.components_.T.astype(np.float32)
+            D = self._project(Xw)
+        return Xw, D
+
+    def transform(self, texts: List[str]):
+        Xw = self._weight(self._counts(texts))
+        return Xw, (self._project(Xw) if self.dense else None)
 
 
-def blocking_report(cand: pd.DataFrame, truth: Dict[str, set], rec_ids: Optional[set] = None) -> Dict[str, float]:
-    """Pair recall of the candidate set and the macro-F0.5 ceiling it implies."""
-    from .utils import macro_f05
-    pos = set(zip(cand["source1_id"], cand["candidate_id"]))
-    n_true = sum(len(v) for v in truth.values())
-    hit = sum(1 for s, ms in truth.items() for m in ms if (s, m) in pos)
-    oracle = {s: {m for m in ms if (s, m) in pos} for s, ms in truth.items()}
-    rep = {"pairs": len(cand), "true_pairs": n_true, "pair_recall": hit / max(n_true, 1),
-           "f05_ceiling": macro_f05(truth, oracle),
-           "reduction_ratio": 1 - len(cand) / max(1, cand["s1_idx"].nunique() * cand["rec_idx"].nunique())}
-    LOG.info("Blocking report: %s", {k: round(v, 4) if isinstance(v, float) else v for k, v in rep.items()})
-    return rep
+# ----------------------------------------------------------------------------------------------
+# key index
+# ----------------------------------------------------------------------------------------------
+def make_keys(df: pd.DataFrame) -> List[List[str]]:
+    out = []
+    for ct, comp, ho, st, po, ft, mf in zip(df["core_toks"], df["compact"], df["house"], df["street"],
+                                             df["postal"], df["first_tok"], df["meta_first"]):
+        toks = list(dict.fromkeys(t for t in ct if len(t) >= 2 and not t.isdigit()))
+        ks = ["t|" + t for t in toks]
+        head = toks[:4]
+        ks += [f"p|{a}|{b}" if a < b else f"p|{b}|{a}" for i, a in enumerate(head) for b in head[i + 1:]]
+        if len(comp) >= 4:
+            ks.append("c|" + comp)
+        if ho and st:
+            ks.append(f"hs|{ho}|{st}")
+        if po and ft:
+            ks.append(f"pf|{po}|{ft}")
+        if mf and po:
+            ks.append(f"mp|{mf}|{po}")
+        if mf and ho:
+            ks.append(f"mh|{mf}|{ho}")
+        if st and ft:
+            ks.append(f"sf|{st}|{ft}")
+        out.append(ks)
+    return out
 
 
-def main():
-    from .pipeline import load_split
-    from .utils import setup_logging, write_candidate_pairs
-    ap = argparse.ArgumentParser(description="Run blocking only and export candidate_pairs.tsv")
-    ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--out", default="output/candidate_pairs.tsv")
-    args = ap.parse_args()
-    setup_logging()
-    cfg = BlockingConfig()
-    split = load_split(args.data_dir)  # reports blocking recall if a ground truth is present
-    spaces = build_spaces(split.s1, split.rec, cfg)
-    cand = attach_ids(generate_candidates(split.s1, split.rec, spaces, cfg), split.s1, split.rec)
-    write_candidate_pairs(args.out, cand)
-    if split.truth is not None:
-        blocking_report(cand, split.truth)
+# ----------------------------------------------------------------------------------------------
+# per-country Source 1 index
+# ----------------------------------------------------------------------------------------------
+@dataclass
+class RecordMats:
+    name_X: sp.csr_matrix
+    full_X: sp.csr_matrix
+    addr_X: sp.csr_matrix
+    name_D: np.ndarray
+    full_D: np.ndarray
 
 
-if __name__ == "__main__":
-    main()
+def _build_faiss(D: np.ndarray, cfg: BlockingConfig, seed: int):
+    N, d = D.shape
+    if faiss is None:
+        return None
+    if N <= cfg.exact_knn_below:
+        index = faiss.IndexFlatIP(d)
+        index.add(D)
+        return index
+    nlist = int(min(65536, max(64, 4 * math.sqrt(N))))
+    quantizer = faiss.IndexFlatIP(d)
+    index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+    rng = np.random.default_rng(seed)
+    index.train(D[rng.choice(N, size=min(N, nlist * 40), replace=False)])
+    index.add(D)
+    index.nprobe = cfg.faiss_nprobe
+    return index
+
+
+def _search(index, D_base: np.ndarray, Q: np.ndarray, k: int):
+    k = min(k, D_base.shape[0])
+    if index is not None:
+        sims, ids = index.search(np.ascontiguousarray(Q, dtype=np.float32), k)
+    else:  # brute force fallback (small partitions only)
+        sims = np.empty((len(Q), k), np.float32)
+        ids = np.empty((len(Q), k), np.int64)
+        for s in range(0, len(Q), 4096):
+            S = Q[s:s + 4096] @ D_base.T
+            top = np.argpartition(-S, k - 1, axis=1)[:, :k]
+            ts = np.take_along_axis(S, top, axis=1)
+            o = np.argsort(-ts, axis=1)
+            ids[s:s + 4096] = np.take_along_axis(top, o, axis=1)
+            sims[s:s + 4096] = np.take_along_axis(ts, o, axis=1)
+    rows = np.repeat(np.arange(len(Q), dtype=np.int64), ids.shape[1])
+    rank = np.tile(np.arange(1, ids.shape[1] + 1, dtype=np.int64), len(Q))
+    ids = ids.ravel()
+    ok = ids >= 0
+    return rows[ok], ids[ok].astype(np.int64), rank[ok]
+
+
+class CountryIndex:
+    """Everything about one country's Source 1 partition needed for blocking and features."""
+
+    def __init__(self, s1c: pd.DataFrame, cfg: BlockingConfig, n_jobs: int = -1, seed: int = 0):
+        if faiss is not None:
+            faiss.omp_set_num_threads(_n_jobs(n_jobs))
+        self.cfg, self.n_jobs = cfg, _n_jobs(n_jobs)
+        self.s1 = s1c.reset_index(drop=True)
+        self.N = len(self.s1)
+        self.name_space = CharSpace(cfg, dense=True, n_jobs=n_jobs)
+        self.full_space = CharSpace(cfg, dense=True, n_jobs=n_jobs)
+        self.addr_space = CharSpace(cfg, dense=False, n_jobs=n_jobs)
+        self.name_X, self.name_D = self.name_space.fit_transform(self.s1["core"].tolist(), seed)
+        self.full_X, self.full_D = self.full_space.fit_transform(self.s1["full"].tolist(), seed)
+        self.addr_X, _ = self.addr_space.fit_transform(self.s1["addr_n"].tolist(), seed)
+        self.name_index = _build_faiss(self.name_D, cfg, seed)
+        self.full_index = _build_faiss(self.full_D, cfg, seed)
+
+        self.hasher = FeatureHasher(n_features=cfg.key_hash_features, input_type="string", alternate_sign=False)
+        K = self.hasher.transform(make_keys(self.s1)).tocsr()
+        K.data[:] = 1.0
+        df = np.bincount(K.indices, minlength=K.shape[1])
+        self.key_ok = (df >= 1) & (df <= cfg.key_max_df)
+        idf = np.zeros(K.shape[1], dtype=np.float32)
+        idf[self.key_ok] = np.log((self.N + 1) / df[self.key_ok]).astype(np.float32)
+        K.data = idf[K.indices]
+        K.eliminate_zeros()
+        self.key_W = K
+        self.key_WT = K.T.tocsr()
+
+        # token idf tables (features) and name frequency ("chain-ness")
+        self.tok_idf = self._idf(self.s1["core_toks"])
+        self.addr_idf = self._idf(self.s1["addr_toks"])
+        self.core_count = self.s1["core"].value_counts().to_dict()
+        self.first_count = self.s1["first_tok"].value_counts().to_dict()
+        # object arrays for fast gathers in feature extraction
+        self.cols: Dict[str, np.ndarray] = {}
+
+    def _idf(self, lists) -> Dict[str, float]:
+        from collections import Counter
+        c = Counter(t for toks in lists for t in set(toks))
+        n = len(lists)
+        return {t: math.log((n + 1) / (v + 1)) + 1 for t, v in c.items()}
+
+    def col(self, name: str) -> np.ndarray:
+        if name not in self.cols:
+            self.cols[name] = np.asarray(self.s1[name].tolist() + [None], dtype=object)[:-1]
+        return self.cols[name]
+
+    # ------------------------------------------------------------------------------------------
+    def query(self, rc: pd.DataFrame) -> Tuple[pd.DataFrame, RecordMats]:
+        cfg = self.cfg
+        name_X, name_D = self.name_space.transform(rc["core"].tolist())
+        full_X, full_D = self.full_space.transform(rc["full"].tolist())
+        addr_X, _ = self.addr_space.transform(rc["addr_n"].tolist())
+        mats = RecordMats(name_X, full_X, addr_X, name_D, full_D)
+        n = len(rc)
+
+        r1, s1, k1 = _search(self.name_index, self.name_D, name_D, cfg.name_topk)
+        r2, s2, k2 = _search(self.full_index, self.full_D, full_D, cfg.full_topk)
+
+        Q = self.hasher.transform(make_keys(rc)).tocsr()
+        Q.data[:] = 1.0
+        Q.data *= self.key_ok[Q.indices]
+        Q.eliminate_zeros()
+        r3, s3, k3 = [], [], []
+        for st in range(0, n, 20_000):
+            S = (Q[st:st + 20_000] @ self.key_WT).tocsr()
+            rr, cc, _, kk = csr_topk(S, cfg.key_topk)
+            r3.append(rr + st), s3.append(cc), k3.append(kk)
+        r3 = np.concatenate(r3) if r3 else np.zeros(0, np.int64)
+        s3 = np.concatenate(s3) if s3 else np.zeros(0, np.int64)
+        k3 = np.concatenate(k3) if k3 else np.zeros(0, np.int64)
+
+        # ---- union (vectorised de-duplication on a combined int64 key) ----
+        rec = np.concatenate([r1, r2, r3])
+        s1i = np.concatenate([s1, s2, s3])
+        src = np.concatenate([np.zeros(len(r1), np.int8), np.ones(len(r2), np.int8), np.full(len(r3), 2, np.int8)])
+        rnk = np.concatenate([k1, k2, k3]).astype(np.int32)
+        key = rec * self.N + s1i
+        uniq, inv = np.unique(key, return_inverse=True)
+        m = len(uniq)
+        big = np.int32(1_000)
+        ranks = np.full((3, m), big, dtype=np.int32)
+        for b in range(3):
+            sel = src == b
+            np.minimum.at(ranks[b], inv[sel], rnk[sel])
+        cand = pd.DataFrame({"rec": (uniq // self.N).astype(np.int64), "s1": (uniq % self.N).astype(np.int64)})
+        cand["b_knn_name"] = (ranks[0] < big).astype(np.int8)
+        cand["b_knn_full"] = (ranks[1] < big).astype(np.int8)
+        cand["b_key"] = (ranks[2] < big).astype(np.int8)
+        cand["knn_name_rank"] = np.minimum(ranks[0], cfg.name_topk + 1)
+        cand["knn_full_rank"] = np.minimum(ranks[1], cfg.full_topk + 1)
+        cand["key_rank"] = np.minimum(ranks[2], cfg.key_topk + 1)
+        cand["n_blockers"] = (cand["b_knn_name"] + cand["b_knn_full"] + cand["b_key"]).astype(np.int8)
+
+        ia, ib = cand["s1"].to_numpy(), cand["rec"].to_numpy()
+        cand["cos_name_d"] = dense_rowdot(self.name_D, name_D, ia, ib)
+        cand["cos_full_d"] = dense_rowdot(self.full_D, full_D, ia, ib)
+        cand["key_score"] = rowwise_dot(self.key_W, Q, ia, ib)
+        cand["cheap"] = (0.4 * cand["cos_name_d"] + 0.4 * cand["cos_full_d"]
+                         + 0.2 * np.tanh(cand["key_score"] / 10.0) + 0.01 * cand["n_blockers"]).astype(np.float32)
+
+        cand = cand.sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
+        cand["cheap_rank"] = (cand.groupby("rec").cumcount() + 1).astype(np.int16)
+        cand = cand[cand["cheap_rank"] <= cfg.max_candidates_per_record].reset_index(drop=True)
+        return cand, mats

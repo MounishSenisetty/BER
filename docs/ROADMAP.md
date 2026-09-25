@@ -19,13 +19,13 @@
 
 ```
  S1 (reference) ─┐                    ┌─────────────── Stage 1: BLOCKING (recall) ───────────────┐
- S2 (vendor A) ──┼─ normalise/parse ─▶│ char-TFIDF kNN(name) ∪ char-TFIDF kNN(name+addr)          │
- S3 (vendor B) ──┘  (once per record) │ ∪ rare-token index ∪ phonetic keys ∪ address keys ∪ LSH   │
+ S2 (vendor A) ──┼─ normalise/parse ─▶│ FAISS kNN(name) ∪ FAISS kNN(name+addr) ∪ sparse key index │
+ S3 (vendor B) ──┘  (once per record) │ per country, streamed in record chunks                    │
                                       │ → cheap re-rank → cap K per record → candidate_pairs.tsv  │
                                       └──────────────────────────┬────────────────────────────────┘
                                                                  ▼
                       ┌──────────── Stage 2: PAIR SCORING (precision) ────────────┐
-                      │ 2A  ~107 features → LightGBM (5 entity-grouped folds)     │
+                      │ 2A  ~100 features → LightGBM (5 entity-grouped folds)     │
                       │ 2B  (optional) cross-encoder on top-k → stacked feature   │
                       └──────────────────────────┬────────────────────────────────┘
                                                  ▼
@@ -36,51 +36,49 @@
                       └────────────────────────────────────────────────────────────┘
 ```
 
-### 1.1 High-recall blocking
+### 1.1 High-recall blocking at competition scale
 
-**Normalisation first (`src/normalize.py`).** Unicode fold, lowercase, `&`→`and`, strip
-punctuation, split glued alphanumerics (`suite12` → `suite 12`), canonicalise abbreviations
-(`street→st`, `svcs→services`, `north→n`), then derive a *core name* with legal suffixes removed
-(`inc, llc, pvt ltd, corp, the …`). Parse address atoms: house number, postal code (last 5–6 digit
-token, which covers US ZIP and Indian PIN), unit/suite number and the first street token. All of
-this happens **once per record**, so pair-level work is just array gathers.
+**Scale drives the design.** Each split has about 2M Source 1 entities and 10M Source 2/3
+records, and the target machine is a Kaggle CPU notebook (4 cores, ~30 GB).
 
-**Generators.** Each generator covers a different failure mode. They are unioned, and each
-contributes a flag that the model later uses as a feature.
+- Nothing is compared across countries: matches never cross countries, which `scripts/eda.py`
+  verifies.
+- Each country's Source 1 side is indexed once, and records stream through in chunks of 400k.
+  Peak memory is therefore one country index plus one chunk.
 
-| # | Generator | Key | Catches | Selectivity control |
-|---|-----------|-----|---------|---------------------|
-| 1 | TF-IDF char 2–4-gram kNN on core name | cosine top-25 | typos, abbreviations, word order, glued tokens | top-k, `max_df` prunes common n-grams |
-| 2 | TF-IDF char kNN on name+address | cosine top-25 | generic names that only the address separates | top-k |
-| 3 | Rare-name-token inverted index | exact token | heavy name noise with a surviving rare token | skip tokens in >100 S1 rows (IDF cap) |
-| 4 | Phonetic compound keys | `metaphone(first)×postal`, `metaphone(first)×house`, `soundex(first)×postal` | spelling variants within the same locality | skip buckets >200 |
-| 5 | Address compound keys | `house×street`, `postal×first token` | badly mangled names at the same address | skip buckets >200 |
-| 6 | MinHash LSH (datasketch) | Jaccard over name+address token set | long-tail overlap patterns | LSH threshold 0.35, 64 perms |
+**Normalisation first (`src/normalize.py`).**
+- Indic-script transliteration runs before accent folding.
+- Dotted acronyms are glued (`S.A.S` → `sas`) and web wrappers stripped.
+- Legal forms for US, India and France are removed anywhere in the name.
+- Abbreviations use a common table plus country tables (in France `St` = saint, in the US `Ste` =
+  suite).
+- US/India state names become codes.
+- Indian names get phonetic spelling normalisation, so `Shree Mahalaxmi` and `श्री महालक्ष्मी`
+  both become `shri mahalakshmi`.
+- Address atoms (house number, postal code, unit, street) are parsed out.
 
-**Budget.** The union is re-ranked with a cheap score (`0.55·cos_name + 0.45·cos_full +
-0.02·#blockers`) and capped at K per record (default 40). The cap is what keeps the pipeline
-linear in the number of records. On the synthetic benchmark the recall curve by cap looks like
-this:
+**Generators (per country, per record chunk).**
 
-| cap K | 1 | 3 | 5 | 10 | 20 | 40 |
-|---|---|---|---|---|---|---|
-| pair recall | 0.965 | 0.982 | 0.984 | 0.986 | 0.989 | 0.994 |
+| # | Generator | Catches | Selectivity control |
+|---|-----------|---------|---------------------|
+| 1 | FAISS IVF kNN on SVD(128) of hashed char-3gram TF-IDF of the core name | typos, abbreviations, transliteration variants | top-10 |
+| 2 | Same on name + address | generic names / chains separated by location | top-10 |
+| 3 | Sparse key index: rare tokens, token pairs, compact name, house×street, postal×first token, metaphone×postal/house, street×first token | exact rare evidence, heavily mangled names at the same address | keys in >100 S1 rows dropped; idf-weighted; top-10 |
 
-Always measure blocking with **two** numbers, both printed by the code: *pair recall*, and the
-**F0.5 ceiling**, which is the macro F0.5 of an oracle that keeps exactly the true pairs among the
-candidates. The ceiling is what bounds the leaderboard. Pair recall alone over-weights entities
-with many matches.
+The union is ranked with a cheap score and capped at `max_candidates_per_record` (default 10).
+Training logs the pair recall at every cap from 1 to K, plus the macro-F0.5 ceiling. Use those
+numbers to pick K: each extra candidate per record costs about 10M feature rows on test.
 
-**Scaling beyond ~1M records.**
-- Swap the scipy matmul in `sparse_topk` for `sparse_dot_topn`, a C++ top-n sparse product.
-- Or reduce the char-TF-IDF with TruncatedSVD to about 256 dimensions and run FAISS IVF/HNSW.
-- Shard by postal prefix when postal coverage is high.
+Throughput measured on 4 cores:
+- normalisation: ~18k records/s;
+- candidate generation: ~6k records/s;
+- features: ~65k pairs/s.
 
-All generators already run in chunks, and the key-based ones are equi-joins.
+For the real test split that is roughly 1–1.5 hours end to end.
 
 ### 1.2 Pair scoring: Stage 2A (GBM) vs Stage 2B (cross-encoder)
 
-**Stage 2A: feature-engineered LightGBM** (`src/features.py`, `src/train.py`). About 107
+**Stage 2A: feature-engineered LightGBM** (`src/features.py`, `src/train.py`). About 100
 features, all vectorised:
 
 - **Lexical name:** Jaro-Winkler, Levenshtein ratio, partial ratio, token sort/set ratio (rapidfuzz

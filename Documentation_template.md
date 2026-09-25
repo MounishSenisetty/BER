@@ -1,134 +1,118 @@
 # Methodology: Business Entity Resolution
 
-> If the organisers' official template uses different headings, map these sections onto them.
-> Numbers marked *(synthetic)* come from `scripts/make_synthetic_data.py`. Replace them with the
-> figures from `models/cv_report.json` after training on the competition data.
+> Copy these sections into the official `Documentation_template.md` headings. Values marked
+> **[fill]** come from `models/cv_report.json` and the inference log of your run.
 
 ## 1. Problem understanding
 
-For every Source 1 (deduplicated reference) business we must return every Source 2 / Source 3
-record that refers to it. The scoring is macro F0.5 over Source 1 entities, where precision
-counts twice as much as recall. An entity with no true match scores 1 only if we predict nothing.
-Only names and addresses are available, and no external data or services are used.
+Source 1 is a deduplicated reference set. For each Source 1 entity we return every Source 2 /
+Source 3 record that refers to the same business. The score is macro F0.5 per Source 1 entity:
 
-Two structural facts shape the solution:
+- precision is weighted twice as much as recall;
+- a singleton scores 1 only when we predict nothing.
 
-- Every S2/S3 record belongs to at most one S1 entity, because S1 is deduplicated.
-- The metric rewards per-entity decisions rather than a single global cut-off.
+Only the provided names, addresses and country labels are used. There are no external lookups,
+APIs, geocoders or pretrained models.
 
-## 2. Pipeline overview
+The data has a few properties that shape the solution:
 
-`normalise → block (6 generators, capped) → 107 pair features → LightGBM (5 entity-grouped folds,
-averaged) → exclusivity + expected-F0.5 subset selection → matching_results.tsv`
+- **Scale.** About 2.2M / 10.3M (train) and 1.7M / 10.0M (test) Source 1 / Source 2+3 records.
+  Every stage streams country partitions and record chunks so it fits a 4-core, 30 GB machine.
+- **Countries.** Train has US and India; test adds France. The country label is used only to
+  partition blocking and to choose abbreviation tables. It is never a model feature, so the model
+  transfers to France.
+- **Noise.** Legal forms are dropped, changed or moved to the front. Names and addresses may be
+  in Devanagari or Kannada script. There are typos, website-style names, garbage prefixes,
+  reordered or missing address components, landmark references and `null` tokens.
 
-| Stage | Code | Output |
-|---|---|---|
-| Normalisation & address parsing | `src/normalize.py` | per-record canonical strings, tokens, phonetic keys, house/postal/unit |
-| Blocking | `src/blocking.py` | `candidate_pairs.tsv` |
-| Features | `src/features.py` | pair feature matrix |
-| Training & CV | `src/train.py` | `models/model_bundle.pkl`, CV report |
-| Decision layer | `src/postprocess.py` | per-entity match sets |
-| Inference | `src/inference.py` | `matching_results.tsv` |
+## 2. Pipeline
 
-## 3. Pre-processing
+`normalise → per-country index (TF-IDF/SVD/FAISS + key index) → capped candidates → ~100
+features → LightGBM (5 entity-grouped folds, averaged) → expected-F0.5 decision → outputs`
 
-Each record goes through the following steps:
+## 3. Normalisation
 
-- Unicode folding, lowercasing, and `&`→`and`; apostrophes and punctuation are removed.
-- Glued alphanumerics are split (`suite12` → `suite 12`).
-- Abbreviations are canonicalised for business words, street types and directions.
-- Legal suffixes are stripped to form the *core name*.
-- Addresses are parsed into house number, postal code (last 5–6 digit number), unit/suite and first
-  street token.
-- Phonetic codes (metaphone, soundex) are computed for the first token, plus a sorted-metaphone
-  signature of the whole name.
+- **Rule-based Indic transliteration.** Covers Devanagari, Bengali, Gurmukhi, Gujarati, Oriya,
+  Tamil, Telugu, Kannada and Malayalam, including Hindi final-schwa deletion. This runs before
+  accent folding, because Indic vowel signs are combining marks.
+- **Clean-up.** Dotted acronyms are glued (`S.A.S` → `sas`, `L.L.C.` → `llc`). Web wrappers are
+  stripped (`wilfordhancock.com` → `wilfordhancock`). Then NFKD accent folding, lowercasing and
+  punctuation removal.
+- **Legal forms** for US, India (including transliterated `प्राइवेट लिमिटेड`) and France
+  (SARL, SAS, SCI, EURL…) are removed anywhere in the name, giving the *core name*.
+- **Abbreviations** are canonicalised with a common table plus country tables. For example, the
+  France table maps `St` → `saint` while the US table maps `Ste` → `suite`. India has its own
+  words: `nr` → near, `opp`, `sector`, `nagar`, and city aliases such as Bengaluru → Bangalore.
+- **State names → codes** for US and India, including transliterated native-script names.
+- **Indian name spelling.** `ph→f`, `oo→u`, `ee→i`, `x→ksh`, `w→v`, and doubled letters are
+  collapsed. This makes Latin and Devanagari renderings of the same name meet, e.g.
+  `Shree Mahalaxmi` / `श्री महालक्ष्मी` → `shri mahalakshmi`.
+- **Address parsing.** House number, postal code (5–6 digits), unit number and first street
+  token.
 
-Source files with split address columns (street/city/state/zip) are concatenated automatically.
+## 4. Candidate generation (blocking)
 
-## 4. Blocking (candidate generation)
+For each country, the Source 1 side is indexed once. Each chunk of 400k Source 2/3 records then
+queries that index:
 
-Each S2/S3 record queries the S1 index. The candidate set is the union of six generators:
+1. **Dense kNN on the core name.** Hashed char 3-gram TF-IDF (idf fitted on Source 1) is
+   compressed with TruncatedSVD to 128 dimensions, then searched with FAISS IVF inner product.
+   Top 10.
+2. **The same on name + address.** Top 10. This separates chains and generic names by location.
+3. **Sparse key index.**
+   - Keys: rare name tokens, token pairs and the compact name.
+   - Compound keys: house number × street, postal code × first token, metaphone × postal code,
+     metaphone × house number, street × first token.
+   - Keys shared by more than 100 Source 1 rows are dropped. Keys are idf-weighted, and matching
+     is a sparse matrix product. Top 10.
 
-1. Char 2–4-gram TF-IDF kNN on the core name (top 25).
-2. The same on name + address (top 25).
-3. Rare-name-token inverted index (tokens in ≤100 S1 rows).
-4. Phonetic compound keys: metaphone/soundex of the first token × postal code or house number.
-5. Address compound keys: house number × street, and postal code × first name token.
-6. MinHash LSH (datasketch, 64 permutations, Jaccard threshold 0.35) over name+address tokens.
+The three lists are merged and ranked by a cheap score (dense cosines plus key overlap), and the
+top 10 per record are kept. This capped set is exactly what the model scores and what
+`candidate_pairs.tsv` contains.
 
-The union is re-ranked with a cheap similarity score and capped at 40 candidates per record. The
-blocking audit reports pair recall, the macro-F0.5 ceiling (the score an oracle classifier could
-reach on these candidates) and the reduction ratio.
+Results on train: pair recall **[fill]**; F0.5 ceiling **[fill]**; recall by cap
+(`recall_at_cap`) **[fill]**; about **[fill]** candidates per record.
 
-*(synthetic)* Pair recall is 0.994 on train and 0.999 on test. The F0.5 ceiling is 0.998. The
-reduction ratio versus the full cross product is 99.3%.
+## 5. Features (~100)
 
-## 5. Features (107)
-
-| Group | Examples |
+| Group | Features |
 |---|---|
-| Fuzzy name | Jaro-Winkler, Levenshtein ratio, partial ratio, token sort/set ratio, compact-string JW, first-token JW |
-| Vector | char-TF-IDF cosine (name, address, full), word-TF-IDF cosine (name, address) |
-| Set overlap | IDF-weighted Jaccard, directional containment, unexplained IDF mass per side (name, address, full) |
-| Address atoms | house / postal / unit / street equality (NaN when missing), numeric-token agreement in address and name |
-| Phonetic | metaphone / soundex equality, phonetic-signature ratio, acronym match |
-| Frequency | log frequency of the core name and first token (chain detection) |
-| Provenance | blocker flags, kNN ranks, cheap score / rank, record source (S2 vs S3) |
-| Context | rank and margin to the best *competing* candidate within the record and within the S1 entity |
+| Fuzzy name | Jaro-Winkler, Levenshtein ratio, partial ratio, token sort/set, compact-string JW, first-token JW |
+| Vector | exact char-TF-IDF cosine (name, address, full), SVD cosines |
+| Set overlap | idf-weighted Jaccard, containment both ways, unexplained idf mass (name, address, full) |
+| Address atoms | house / postal / unit / street equality (missing ≠ different), numeric-token agreement |
+| Phonetic | metaphone / soundex, phonetic-signature ratio, acronym |
+| Frequency | how common the core name is among the country's Source 1 (chains) |
+| Provenance | which generator proposed the pair, ranks, key score, cheap score |
+| Context | rank and margin of the pair among the record's other candidates (soft exclusivity: a record has at most one owner) |
 
-All features are computed as vectorised array operations: rapidfuzz `cpdist` (multi-threaded) and
-sparse row-wise products.
+## 6. Model and training
 
-## 6. Model
+- **Blocking runs over the full training split**, so candidate density and competition between
+  similar entities match test.
+- **Stratified sample of 120k Source 1 entities**, stratified by match count. Every candidate
+  pair of a sampled entity is labelled and featurised.
+- **Classifier:** LightGBM binary (logloss), 5 folds grouped by Source 1 entity, early stopping.
+  The fold models are averaged at inference.
+- **Results:** OOF logloss **[fill]**, AUC **[fill]**.
 
-- LightGBM binary classifier: learning rate 0.03, 63 leaves, feature/bagging fraction 0.8.
-  Training uses early stopping on the validation fold's logloss.
-- The five fold models are averaged at inference time. This keeps test probabilities on the same
-  scale as the OOF probabilities that the decision threshold was tuned on.
+## 7. Decision layer (macro F0.5)
 
-*(synthetic)* OOF logloss is 0.0040 and AUC is 0.9998. The top features by gain are the
-record-level margin to the best competitor, the cheap-score rank and the name+address cosine.
+For each entity, candidates are sorted by probability p. We compute:
 
-## 7. Decision layer for macro F0.5
+- `E[F|k] ≈ 1.25·Σ_{i≤k} p_i / (0.25·Σ p_i + k)`, the expected score of predicting the top k;
+- `E[F|0] = Π(1 − p_i)`, the probability that the entity is a singleton.
 
-1. **Exclusivity:** a record may only be assigned to its highest-probability S1 entity.
-2. **Expected-F0.5 subset selection per entity.** Candidates are sorted by p, and the top-k is
-   chosen to maximise `E[F|k] ≈ 1.25·Σ_{i≤k} p_i / (0.25·Σ p_i + k)`. The empty prediction's value
-   is compared against `E[F|0] = Π(1 − p_i)`, which is the probability that the entity is a
-   singleton.
-3. The mode (expected-F vs global threshold), the exclusivity switch and a probability floor are
-   grid-searched on OOF predictions. The objective includes entities whose matches were missed by
-   blocking. The final threshold is the median of the near-optimal plateau.
+We then predict the best k, or nothing. This is compared with a global threshold, and the mode and
+floor are grid-searched on OOF predictions over all sampled entities, including their blocking
+misses. A nested estimate tunes on 4 folds and evaluates on the 5th.
 
-*(synthetic)* The selected rule is expected-F with exclusivity on and a floor of 0.30.
+Selected rule **[fill]**. Nested-CV macro F0.5 **[fill]** (singletons **[fill]**, matched
+**[fill]**).
 
-## 8. Validation
+## 8. Validation and reproducibility
 
-- Five folds are assigned **per Source 1 entity** and stratified by match count (0/1/2/3+). Every
-  candidate pair inherits its entity's fold, so match sets are never split across folds.
-- Decision-rule tuning is nested: tune on four folds' OOF, evaluate on the fifth.
-
-| Estimate | Macro F0.5 *(synthetic)* |
-|---|---|
-| OOF, rule tuned on all folds | 0.9706 (singletons 0.976 / matched 0.968) |
-| Nested CV | 0.9700 (folds 0.965–0.974) |
-| Independent hold-out split | 0.9678 |
-
-## 9. Reproducibility
-
-```bash
-pip install -r requirements.txt
-./run_pipeline.sh                    # train on data/train, predict data/test -> output/
-SYNTHETIC=1 ./run_pipeline.sh        # self-contained demo on generated data
-python -m pytest -q tests            # metric / decision-layer unit tests
-```
-
-- Seeds are fixed, so a CPU-only run is deterministic.
-- A full synthetic run takes about 1.5 minutes on 4 cores.
-- All settings live in `src/config.py`.
-
-## 10. Compliance
-
-- Only the provided tables are used.
-- There are no geocoding calls, external APIs, reference databases or downloaded models.
-- TF-IDF statistics are fitted on each split's own text and use no labels.
+- Folds are split per Source 1 entity, stratified by match count 0/1/2/3+. Entities are never
+  split across folds.
+- The outputs pass `utils/validate_submission.py` (with `--check-ids`).
+- Run commands are in `README.md`. Seeds are fixed. Runtime on Kaggle CPU is **[fill]**.

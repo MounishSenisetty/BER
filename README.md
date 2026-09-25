@@ -1,93 +1,76 @@
 # BER: Business Entity Resolution (Amazon ML Challenge 2026)
 
-A pipeline that links each Source 1 reference business to its Source 2 / Source 3 records. It runs
-in three stages: high-recall blocking, LightGBM pair scoring, and a decision layer tuned for macro
-F0.5.
+For every Source 1 business, this pipeline finds the matching Source 2 / Source 3 records. It is
+built for the full competition data (~2M Source 1 entities and ~10M Source 2/3 records per split)
+on a Kaggle CPU notebook.
 
-- Strategy and architecture: [`docs/ROADMAP.md`](docs/ROADMAP.md)
+Stages:
+1. normalise (including Indic-script transliteration);
+2. scalable blocking (FAISS kNN + sparse key index, per country, in record chunks);
+3. LightGBM pair scoring;
+4. a decision layer tuned for macro F0.5.
+
+- Strategy: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Methodology write-up: [`Documentation_template.md`](Documentation_template.md)
 
-## Quick start
+## Reproduce end-to-end
 
 ```bash
 pip install -r requirements.txt
-
-# put the competition files here (names are auto-detected: *source*1*, *source*2*, *source*3*, *ground*truth*)
-#   data/train/{source1,source2,source3}.tsv  data/train/train_ground_truth.tsv
-#   data/test/{source1,source2,source3}.tsv
-./run_pipeline.sh
-
-# or try it end-to-end on a generated dataset (includes a labelled hold-out)
-SYNTHETIC=1 ./run_pipeline.sh
+DATA=/path/to/student_resource/dataset
+python scripts/eda.py --train-dir $DATA/train --test-dir $DATA/test            # optional analysis
+python -m src.train     --data-dir $DATA/train --model-dir models             # blocking + features + CV + threshold
+python -m src.inference --data-dir $DATA/test  --model-dir models --out-dir output
+python $DATA/../utils/validate_submission.py --matching output/matching_results.tsv \
+       --candidate output/candidate_pairs.tsv --test-dir $DATA/test
+python scripts/make_submission_zip.py --team <team> --out-dir output --doc Documentation_template.md
 ```
 
-You can also run each step on its own:
+Input files are found automatically (`train_source1.tsv` … `train_ground_truth.tsv`,
+`test_source1.tsv` …). The columns are `entity_id, business_name, business_address, country`.
+
+Useful flags:
+- `--train-entities N`: Source 1 entities used for training (default 120k; `0` = all).
+- `--max-candidates K`: candidates kept per record (default 10).
+- `--chunk-records N`: records per chunk; lower it if memory is tight.
+
+Try the whole pipeline on generated data:
 
 ```bash
-python -m src.train     --data-dir data/train --model-dir models
-python -m src.inference --data-dir data/test  --model-dir models --out-dir output [--gt path/to/labels.tsv] [--dump-scores]
-python -m src.blocking  --data-dir data/test  --out output/candidate_pairs.tsv     # blocking only
-python -m pytest -q tests
-```
-
-Paths can be overridden with `--s1 --s2 --s3 --gt`.
-
-Column detection:
-- **Id column:** the column containing `id`.
-- **Name column:** the column containing `name`.
-- **Address:** every remaining address-like column, concatenated.
-
-## Kaggle notebook
-
-The competition files live under `/kaggle/input/<dataset>/student_resource/dataset/{train,test}`
-(`train_source1.tsv`, …, `train_ground_truth.tsv`, `test_source1.tsv`, …). They are auto-detected.
-The input folder is read-only, so write models and outputs to `/kaggle/working`.
-
-```bash
-python scripts/eda.py --train-dir $TRAIN --test-dir $TEST                         # analyse the data first
-python -m src.train --data-dir $TRAIN --model-dir /kaggle/working/models
-python -m src.inference --data-dir $TEST --model-dir /kaggle/working/models --out-dir /kaggle/working/output
-python scripts/check_submission.py --data-dir $TEST --out-dir /kaggle/working/output
-```
-
-`jellyfish` and `datasketch` are optional:
-- without `jellyfish`, built-in phonetic codes are used;
-- without `datasketch`, the LSH blocker is skipped.
-
-## Layout
-
-```
-src/config.py       all hyper-parameters (blocking budget, LightGBM, decision grid)
-src/utils.py        TSV I/O, exact macro-F0.5 metric (+ vectorised version for threshold search)
-src/normalize.py    text normalisation, abbreviation/legal-suffix handling, address parsing, phonetics
-src/blocking.py     6 candidate generators (TF-IDF kNN x2, token index, phonetic, address, MinHash LSH)
-src/features.py     107 vectorised pair features (rapidfuzz cpdist, sparse ops, context features)
-src/postprocess.py  exclusivity + expected-F0.5 subset selection, OOF rule search
-src/pipeline.py     shared load -> normalise -> block -> featurise (train/inference parity)
-src/train.py        entity-grouped stratified CV, OOF, feature importance, nested threshold tuning
-src/inference.py    produces output/candidate_pairs.tsv and output/matching_results.tsv
-scripts/make_synthetic_data.py   realistic noisy dataset generator for local testing
-scripts/eda.py                   dataset analysis + checks of the pipeline's assumptions
-scripts/check_submission.py      format checks for matching_results.tsv / candidate_pairs.tsv
-tests/test_core.py  metric edge cases, fast/exact metric agreement, decision logic
+python scripts/make_synthetic_data.py --out data/dataset
+python -m src.train --data-dir data/dataset/train --model-dir models --train-entities 0
+python -m src.inference --data-dir data/dataset/test --model-dir models --out-dir output \
+       --gt data/dataset/test_labels/test_ground_truth.tsv
 ```
 
 ## Outputs
 
 | File | Format |
 |---|---|
-| `output/matching_results.tsv` | `source1_id<TAB>matches`: one row per Source 1 entity, comma-separated ids, empty string for no match. The header is copied from the training ground truth. |
-| `output/candidate_pairs.tsv` | `source1_id<TAB>candidate_id<TAB>candidate_source`: every pair produced by blocking. |
-| `models/cv_report.json` | Blocking recall and F0.5 ceiling, OOF logloss/AUC, tuned rule, nested CV score. |
-| `models/feature_importance.csv`, `models/threshold_curve.csv`, `models/oof_predictions.tsv` | Material for error analysis. |
+| `output/matching_results.tsv` | `source1_entity_id<TAB>matched_entity_ids`. One row per test Source 1 entity; ids are comma-separated; the list is empty for no match. |
+| `output/candidate_pairs.tsv` | `source1_entity_id<TAB>candidate_entity_ids`. Exactly the capped candidate set the classifier scores, so every match is also a candidate. |
+| `models/cv_report.json` | Blocking recall and F0.5 ceiling, recall by per-record cap, OOF logloss/AUC, tuned rule, nested-CV macro F0.5. |
 
-## Results on the synthetic benchmark
+## Layout
 
-These numbers come from 6k S1 entities and ~8.8k noisy records in train, plus a 4k-entity hold-out.
+```
+src/config.py       all settings (blocking budget, FAISS, LightGBM, decision grid)
+src/utils.py        TSV I/O, exact macro-F0.5 metric, output writers
+src/normalize.py    Indic transliteration, legal forms (US/IN/FR), abbreviations, state/city aliases, address parsing
+src/blocking.py     per-country index: hashed char TF-IDF -> SVD -> FAISS kNN (name, name+address) + sparse key index
+src/features.py     ~100 vectorised pair features (rapidfuzz cpdist, sparse ops, record-context features)
+src/postprocess.py  expected-F0.5 subset selection / threshold, OOF rule search
+src/pipeline.py     streaming driver: country partitions x record chunks (bounded memory)
+src/train.py        full-split blocking, sampled-entity features, entity-grouped CV, nested threshold tuning
+src/inference.py    writes candidate_pairs.tsv + matching_results.tsv
+scripts/            eda.py, make_synthetic_data.py, make_submission_zip.py
+tests/test_core.py  metric, decision layer, normalisation, output format
+```
 
-| Metric | Value |
-|---|---|
-| Blocking pair recall (train / test) | 0.994 / 0.999 |
-| Nested-CV macro F0.5 | 0.970 |
-| Hold-out macro F0.5 | 0.968 |
-| Full run time (4 CPU cores) | ~1.5 min |
+Licences:
+- LightGBM: MIT.
+- FAISS: MIT.
+- rapidfuzz: MIT.
+- scikit-learn: BSD.
+
+No pretrained models are used, and no external data or services are called.

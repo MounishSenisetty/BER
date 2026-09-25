@@ -62,3 +62,37 @@ def test_ground_truth_parsing(tmp_path):
     truth, header = load_ground_truth(str(f), ["A", "B", "C"])
     assert header == ("source1_id", "matches")
     assert truth == {"A": {"x", "y"}, "B": set(), "C": set()}
+
+
+def test_transliteration_and_legal_forms():
+    from src.normalize import _prep_one, clean
+    assert clean("आदित्य") == "aditya"
+    assert clean("महाराष्ट्र") == "maharashtra"
+    assert clean("Fractales Amis Groupe S.A.S") == "fractales amis groupe sas"
+    assert clean("wilfordhancock.com") == "wilfordhancock"
+    # Devanagari and Latin renderings of the same Indian name meet after normalisation
+    assert _prep_one("श्री महालक्ष्मी ट्रेडर्स प्राइवेट लिमिटेड", "", "India")[1] == \
+        _prep_one("Shree Mahalaxmi Tredars Pvt. Ltd.", "", "India")[1]
+    # legal forms are removed wherever they appear
+    assert _prep_one("LLC Moncada Learning Center", "", "US")[1] == "moncada learning center"
+    assert _prep_one("Zephay Labs SARL", "", "France")[1] == "zephay laboratories"
+
+
+def test_write_id_lists_format(tmp_path):
+    from src.utils import MATCHING_HEADER, write_id_lists
+    p = tmp_path / "m.tsv"
+    write_id_lists(str(p), MATCHING_HEADER, ["S1-1", "S1-2", "S1-3"], np.array([2, 0, 0]),
+                   np.array(["S3-9", "S2-5", "S2-5"], dtype=object), order=np.array([0.9, 0.2, 0.8]))
+    lines = p.read_text().splitlines()
+    assert lines[0] == "source1_entity_id\tmatched_entity_ids"
+    assert lines[1:] == ["S1-1\tS2-5", "S1-2\t", "S1-3\tS3-9"]     # every S1 row, no duplicate ids
+
+
+def test_group_context():
+    from src.features import _group_context
+    g = np.array([5, 5, 5, 7])
+    x = np.array([0.2, 0.9, 0.5, 0.3], dtype=np.float32)
+    rank, gap = _group_context(g, x)
+    assert rank.tolist() == [3, 1, 2, 1]
+    assert np.allclose(gap[:3], [0.2 - 0.9, 0.9 - 0.5, 0.5 - 0.9])
+    assert np.isnan(gap[3])                                        # lone candidate: no competitor
