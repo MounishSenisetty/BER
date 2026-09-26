@@ -27,6 +27,7 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+from rapidfuzz.distance import OSA
 
 try:
     import jellyfish
@@ -49,6 +50,25 @@ LEGAL_SUFFIXES = {
     # other common forms
     "gmbh", "ag", "bv", "nv", "pty", "srl", "spa", "ab", "oy", "kg",
 }
+# long legal words also matched with typos ("Limied", "PIRVATE", "Incorprated"), plus 3-letter
+# abbreviations with swapped letters ("Ldt", "Ptv") -- otherwise a mistyped legal form stays in
+# the core name and looks like the unexplained extra token of a branch distractor
+_LEGAL_FUZZY = ("limited", "private", "company", "corporation", "incorporated", "compagnie", "societe")
+_LEGAL_ANAGRAM = {"".join(sorted(w)): w for w in ("ltd", "pvt")}
+
+
+@lru_cache(maxsize=1_000_000)
+def is_legal(tok: str) -> bool:
+    if tok in LEGAL_SUFFIXES:
+        return True
+    if len(tok) == 3:
+        return "".join(sorted(tok)) in _LEGAL_ANAGRAM
+    if len(tok) < 6:
+        return False
+    return any(OSA.distance(tok, w, score_cutoff=1 if len(w) < 9 else 2) <= (1 if len(w) < 9 else 2)
+               for w in _LEGAL_FUZZY if abs(len(w) - len(tok)) <= 2)
+
+
 WEB_TOKENS = {"www", "http", "https"}
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
@@ -368,9 +388,10 @@ def _india_phonetic(tok: str) -> str:
 def _prep_one(name: str, address: str, country: str):
     ckey = country_key(country)
     nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
+    legal = [is_legal(t) for t in nt]            # before phonetics mangle typos ("lximited")
     if ckey == "india":
         nt = [_india_phonetic(t) for t in nt]
-    ct = [t for t in nt if t not in LEGAL_SUFFIXES] or nt
+    ct = [t for t, lg in zip(nt, legal) if not (lg or is_legal(t))] or nt
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)

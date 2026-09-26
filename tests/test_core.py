@@ -105,3 +105,10 @@ def test_branch_numerals_become_digits():
     out = prepare(df, n_jobs=1)
     assert out["core_toks"][0] == ["duga", "enterprises", "2"]   # not collapsed to a one-letter "i"
     assert out["name_nums"][1] == ["3"]
+
+
+def test_mistyped_legal_forms_leave_the_core_name():
+    from src.normalize import _prep_one, is_legal
+    assert _prep_one("Sharma Finance LXIMITED", "", "India")[1] == "sharma finance"
+    assert _prep_one("Om Infratech Pvt Ldt", "", "India")[1] == "om infratech"
+    assert not is_legal("limitless") and not is_legal("compact")
