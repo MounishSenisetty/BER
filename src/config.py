@@ -60,7 +60,7 @@ class ModelConfig:
 @dataclass
 class DecisionConfig:
     """Post-processing search space (tuned on OOF predictions for macro F0.5)."""
-    modes: tuple = ("threshold", "expected_f")
+    modes: tuple = ("threshold", "expected_f", "two_floor")
     # hard exclusivity needs every candidate of a record scored; training only scores pairs of the
     # sampled entities, so it cannot be tuned honestly -- the model learns it softly via context features
     exclusive_options: tuple = (False,)

@@ -118,6 +118,7 @@ def main():
     ap.add_argument("--model-dir", default="models")
     ap.add_argument("--s1"), ap.add_argument("--s2"), ap.add_argument("--s3"), ap.add_argument("--gt")
     ap.add_argument("--folds", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="seed for entity sample, folds and LightGBM")
     ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
@@ -131,6 +132,8 @@ def main():
     cfg = PipelineConfig()
     if args.folds:
         cfg.model.n_folds = args.folds
+    if args.seed is not None:
+        cfg.model.seed = args.seed
     if args.train_entities is not None:
         cfg.model.train_entities = args.train_entities
     if args.max_candidates:
@@ -200,7 +203,7 @@ def main():
     dc = cfg.decision
     best, curve = search_decision(ent, prec, oof, y, n_true_E, dc.modes, dc.exclusive_options, dc.grid)
     curve.to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
-    sel = select(ent, prec, oof, best["mode"], best["threshold"], best["exclusive"])
+    sel = select(ent, prec, oof, best["mode"], best["threshold"], best["exclusive"], threshold2=best["threshold2"])
     single = n_true_E == 0
 
     def breakdown(mask_e):
@@ -221,7 +224,7 @@ def main():
         n_true_other = np.where(ent_fold != f, n_true_E, 0.0)
         b_f, _ = search_decision(ent[~in_f], prec[~in_f], oof[~in_f], y[~in_f], n_true_other,
                                  dc.modes, dc.exclusive_options, dc.grid[::2], verbose=False)
-        sel_f = select(ent, prec, oof, b_f["mode"], b_f["threshold"], b_f["exclusive"])
+        sel_f = select(ent, prec, oof, b_f["mode"], b_f["threshold"], b_f["exclusive"], threshold2=b_f["threshold2"])
         ents_f = ent_fold == f
         n_true_f = np.where(ents_f, n_true_E, 0.0)
         score_all = fast_macro_f05(ent[in_f], sel_f[in_f], y[in_f], n_true_f)

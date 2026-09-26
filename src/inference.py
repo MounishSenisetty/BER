@@ -45,7 +45,8 @@ def main():
     rule = dict(bundle["decision"])
     if args.threshold is not None:
         rule["threshold"] = args.threshold
-    LOG.info("Decision rule: mode=%s exclusive=%s threshold=%.3f", rule["mode"], rule["exclusive"], rule["threshold"])
+    LOG.info("Decision rule: mode=%s exclusive=%s threshold=%.3f threshold2=%s", rule["mode"], rule["exclusive"],
+             rule["threshold"], rule.get("threshold2"))
     boosters = [lgb.Booster(model_str=s) for s in bundle["boosters"]]
     feats = bundle["features"]
 
@@ -77,7 +78,7 @@ def main():
         write_id_lists(os.path.join(args.out_dir, "candidate_pairs.tsv"), CANDIDATE_HEADER, s1_ids,
                        ps1, rec_ids[prec], order=cheap)
         sel = select(ps1.astype(np.int64), prec.astype(np.int64), prob, rule["mode"], rule["threshold"],
-                     bool(rule["exclusive"]))
+                     bool(rule["exclusive"]), threshold2=rule.get("threshold2"))
         n_nonempty = write_id_lists(os.path.join(args.out_dir, "matching_results.tsv"), MATCHING_HEADER, s1_ids,
                                     ps1[sel], rec_ids[prec[sel]], order=prob[sel])
     LOG.info("Predicted %d matches for %d / %d Source 1 entities", int(sel.sum()), n_nonempty, len(s1_ids))
