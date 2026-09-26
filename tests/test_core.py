@@ -96,3 +96,32 @@ def test_group_context():
     assert rank.tolist() == [3, 1, 2, 1]
     assert np.allclose(gap[:3], [0.2 - 0.9, 0.9 - 0.5, 0.5 - 0.9])
     assert np.isnan(gap[3])                                        # lone candidate: no competitor
+
+
+def test_branch_numerals_become_digits():
+    from src.normalize import prepare
+    df = pd.DataFrame({"id": ["a", "b"], "name": ["Duga Enterprises II", "Store III"], "address": ["", ""],
+                       "country": ["India", "US"], "source": [2, 2]})
+    out = prepare(df, n_jobs=1)
+    assert out["core_toks"][0] == ["duga", "enterprises", "2"]   # not collapsed to a one-letter "i"
+    assert out["name_nums"][1] == ["3"]
+
+
+def test_mistyped_legal_forms_leave_the_core_name():
+    from src.normalize import _prep_one, is_legal
+    assert _prep_one("Sharma Finance LXIMITED", "", "India")[1] == "sharma finance"
+    assert _prep_one("Om Infratech Pvt Ldt", "", "India")[1] == "om infratech"
+    assert _prep_one("Nguyen Restaurant II Incorporated", "", "US")[1] == "nguyen restaurant 2"
+    assert _prep_one("PRIVATE LIMITED OM RAM", "", "India")[1] == "om ram"
+    assert _prep_one("Kumar Construction PvtL td", "", "India")[1] == "kumar construction"
+    assert _prep_one("Holiday Inn", "", "US")[1] == "holiday inn"
+    assert not is_legal("limitless") and not is_legal("compact")
+
+
+def test_canonical_legal_form():
+    from src.normalize import COLUMNS, _prep_one
+    li = COLUMNS.index("legal")
+    assert _prep_one("Ram Traders Private (Limited)", "", "India")[li] == "pvtltd"
+    assert _prep_one("राम ट्रेडर्स प्राइवेट लिमिटेड", "", "India")[li] == "pvtltd"
+    assert _prep_one("Green Logistics Inc.", "", "US")[li] == "inc"
+    assert _prep_one("Sunny Burger", "", "US")[li] == ""

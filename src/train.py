@@ -60,38 +60,8 @@ def entity_folds(n_true_e: np.ndarray, n_folds: int, seed: int) -> np.ndarray:
     return folds
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data-dir", default="data/train")
-    ap.add_argument("--model-dir", default="models")
-    ap.add_argument("--s1"), ap.add_argument("--s2"), ap.add_argument("--s3"), ap.add_argument("--gt")
-    ap.add_argument("--folds", type=int, default=None)
-    ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
-    ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
-    ap.add_argument("--chunk-records", type=int, default=None)
-    args = ap.parse_args()
-    setup_logging()
-    os.makedirs(args.model_dir, exist_ok=True)
-
-    cfg = PipelineConfig()
-    if args.folds:
-        cfg.model.n_folds = args.folds
-    if args.train_entities is not None:
-        cfg.model.train_entities = args.train_entities
-    if args.max_candidates:
-        cfg.blocking.max_candidates_per_record = args.max_candidates
-    if args.chunk_records:
-        cfg.blocking.chunk_records = args.chunk_records
-
-    split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
-    if split.truth is None:
-        raise SystemExit("Training needs a ground-truth file (--gt)")
-    n_true = entity_true_counts(split)
-    owner = owner_array(split)
-    in_E = sample_entities(n_true, cfg.model.train_entities, cfg.model.seed)
-    LOG.info("Training entities: %d of %d (singletons %.1f%%)", in_E.sum(), len(in_E),
-             100 * (n_true[in_E] == 0).mean())
-
+def build_training_set(split, cfg, n_true, owner, in_E):
+    """Blocking over the full split + features for the sampled entities' candidate pairs."""
     K = cfg.blocking.max_candidates_per_record
     found = np.zeros(len(n_true))
     rank_hist = np.zeros(K + 1)
@@ -139,6 +109,56 @@ def main():
     ps1 = np.concatenate(s1s)
     prec = np.concatenate(recs)
     del Xs
+    return X, y, ps1, prec, blk
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", default="data/train")
+    ap.add_argument("--model-dir", default="models")
+    ap.add_argument("--s1"), ap.add_argument("--s2"), ap.add_argument("--s3"), ap.add_argument("--gt")
+    ap.add_argument("--folds", type=int, default=None)
+    ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
+    ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
+    ap.add_argument("--chunk-records", type=int, default=None)
+    ap.add_argument("--feature-cache", default=None,
+                    help="pickle of the training feature matrix: loaded if it exists, else written")
+    ap.add_argument("--lgb-params", default=None, help='JSON overrides of the LightGBM params, e.g. \'{"num_leaves": 63}\'')
+    args = ap.parse_args()
+    setup_logging()
+    os.makedirs(args.model_dir, exist_ok=True)
+
+    cfg = PipelineConfig()
+    if args.folds:
+        cfg.model.n_folds = args.folds
+    if args.train_entities is not None:
+        cfg.model.train_entities = args.train_entities
+    if args.max_candidates:
+        cfg.blocking.max_candidates_per_record = args.max_candidates
+    if args.chunk_records:
+        cfg.blocking.chunk_records = args.chunk_records
+    if args.lgb_params:
+        cfg.model.params.update(json.loads(args.lgb_params))
+
+    split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
+    if split.truth is None:
+        raise SystemExit("Training needs a ground-truth file (--gt)")
+    n_true = entity_true_counts(split)
+    owner = owner_array(split)
+    in_E = sample_entities(n_true, cfg.model.train_entities, cfg.model.seed)
+    LOG.info("Training entities: %d of %d (singletons %.1f%%)", in_E.sum(), len(in_E),
+             100 * (n_true[in_E] == 0).mean())
+
+    cache = args.feature_cache
+    if cache and os.path.exists(cache):
+        with timer(f"Loading feature cache {cache}"):
+            with open(cache, "rb") as fh:
+                X, y, ps1, prec, blk = pickle.load(fh)
+    else:
+        X, y, ps1, prec, blk = build_training_set(split, cfg, n_true, owner, in_E)
+        if cache:
+            with open(cache, "wb") as fh:
+                pickle.dump((X, y, ps1, prec, blk), fh, protocol=4)
     LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d", len(y), y.sum(), 100 * y.mean(), X.shape[1])
 
     # ------------------------------------------------------------ entity-grouped CV

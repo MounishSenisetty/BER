@@ -33,6 +33,15 @@ Useful flags:
 - `--train-entities N`: Source 1 entities used for training (default 120k; `0` = all).
 - `--max-candidates K`: candidates kept per record (default 10).
 - `--chunk-records N`: records per chunk; lower it if memory is tight.
+- `--feature-cache PATH`: save the training feature matrix (or load it if it exists), so model and
+  decision experiments skip blocking and features.
+- `--lgb-params JSON`: override LightGBM params, e.g. `'{"num_leaves": 63}'`.
+
+Error analysis and experiment log:
+- `python scripts/error_analysis.py --data-dir $DATA/train --model-dir models` buckets the worst OOF
+  false positives / negatives (including blocking misses) into noise / edge-case / sparse / boundary.
+- [`experiments.csv`](experiments.csv) records every ablation with its CV score and whether it was
+  kept or reverted.
 
 Try the whole pipeline on generated data:
 

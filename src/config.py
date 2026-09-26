@@ -45,9 +45,9 @@ class ModelConfig:
     params: dict = field(default_factory=lambda: {
         "objective": "binary",
         "metric": "binary_logloss",
-        "learning_rate": 0.05,
-        "num_leaves": 127,
-        "min_child_samples": 50,
+        "learning_rate": 0.03,
+        "num_leaves": 63,
+        "min_child_samples": 20,
         "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
         "bagging_freq": 1,

@@ -27,6 +27,7 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+from rapidfuzz.distance import OSA
 
 try:
     import jellyfish
@@ -49,6 +50,91 @@ LEGAL_SUFFIXES = {
     # other common forms
     "gmbh", "ag", "bv", "nv", "pty", "srl", "spa", "ab", "oy", "kg",
 }
+# long legal words also matched with typos ("Limied", "PIRVATE", "Incorprated"), plus 3-letter
+# abbreviations with swapped letters ("Ldt", "Ptv") -- otherwise a mistyped legal form stays in
+# the core name and looks like the unexplained extra token of a branch distractor
+_LEGAL_FUZZY = ("limited", "private", "company", "corporation", "incorporated", "compagnie", "societe")
+_LEGAL_ANAGRAM = {"".join(sorted(w)): w for w in ("ltd", "pvt")}
+
+
+@lru_cache(maxsize=1_000_000)
+def is_legal(tok: str) -> bool:
+    if tok in LEGAL_SUFFIXES:
+        return True
+    if len(tok) == 3:
+        return "".join(sorted(tok)) in _LEGAL_ANAGRAM
+    if len(tok) < 6:
+        return False
+    return any(OSA.distance(tok, w, score_cutoff=1 if len(w) < 9 else 2) <= (1 if len(w) < 9 else 2)
+               for w in _LEGAL_FUZZY if abs(len(w) - len(tok)) <= 2)
+
+
+# legal forms as they appear with broken spacing / typos at either edge of a name:
+# "PvtL td", "PVTLTD", "Pvtc Ltd", "LcLP", "OCRP", "PvtLtd Gupta Jewellers"
+_LEGAL_GLUED = ("pvtltd", "privatelimited", "pvtlimited", "privateltd", "coltd", "ltd", "pvt", "llp",
+                "llc", "inc", "corp", "limited", "private", "incorporated", "corporation", "company", "plc")
+
+
+@lru_cache(maxsize=1_000_000)
+def is_glued_legal(s: str, joined: bool = False) -> bool:
+    """`joined`: s spans several tokens -- one edit at most, so a real neighbouring word is never
+    absorbed ("privatelimited" + "om" is two edits away from "privatelimited")."""
+    if s in _LEGAL_GLUED:
+        return True
+    if len(s) < 4:                               # "inn", "ink" must not become "inc"
+        return False
+    return any(OSA.distance(s, w, score_cutoff=2) <= (2 if len(w) >= 8 and not joined else 1)
+               for w in _LEGAL_GLUED if abs(len(w) - len(s)) <= 2)
+
+
+def _peel_legal_edges(toks: List[str], legal: List[bool], max_join: int = 4) -> List[int]:
+    """Indices of `toks` left after repeatedly removing legal forms (possibly split / glued /
+    mistyped over up to `max_join` tokens) from the end and the start of the name."""
+    idx = list(range(len(toks)))
+    for from_end in (True, False):
+        changed = True
+        while changed and len(idx) > 1:
+            changed = False
+            for k in range(min(max_join, len(idx) - 1), 0, -1):
+                part = idx[-k:] if from_end else idx[:k]
+                if all(legal[i] for i in part) or (
+                        not any(toks[i].isdigit() for i in part)     # branch numbers stay ("II Inc")
+                        and is_glued_legal("".join(toks[i] for i in part), k > 1)):
+                    idx = idx[:-k] if from_end else idx[k:]
+                    changed = True
+                    break
+    return idx
+
+
+# canonical legal form of a name ("Pvt. Ltd." / "Private (Limited)" / "PvtL td" -> pvtltd): two S1
+# entities with the same core name are often told apart only by it ("... LLC" vs "... Inc")
+_LEGAL_CANON = {
+    "inc": "inc", "incorporated": "inc", "corp": "corp", "corporation": "corp", "co": "co",
+    "company": "co", "kampani": "co", "ltd": "ltd", "limited": "ltd", "limitd": "ltd", "coltd": "ltd",
+    "pvt": "pvtltd", "pvtltd": "pvtltd", "privatelimited": "pvtltd", "pvtlimited": "pvtltd",
+    "privateltd": "pvtltd", "praivetlimitd": "pvtltd", "privetlimitd": "pvtltd", "llc": "llc", "llp": "llp",
+    "elelpi": "llp", "elaelapi": "llp", "elelapi": "llp", "plc": "plc", "pllc": "pllc", "sarl": "sarl",
+    "sas": "sas", "sasu": "sasu", "eurl": "eurl", "sa": "sa", "sci": "sci", "snc": "snc", "gmbh": "gmbh",
+}
+_LEGAL_STOP = {"the", "and", "of", "et", "de", "du", "des", "la", "le", "les", "dba"}
+
+
+@lru_cache(maxsize=1_000_000)
+def canon_legal(s: str) -> str:
+    """Joined removed-legal tokens -> canonical form; '' when absent or unrecognisable."""
+    if not s or s in _LEGAL_CANON:
+        return _LEGAL_CANON.get(s, "")
+    if len(s) < 4:
+        return ""
+    best, dist = "", 3
+    for k, v in _LEGAL_CANON.items():
+        if abs(len(k) - len(s)) <= 2 and len(k) >= 3:
+            d = OSA.distance(s, k, score_cutoff=2)
+            if d < dist and d <= (2 if len(k) >= 8 else 1):
+                best, dist = v, d
+    return best
+
+
 WEB_TOKENS = {"www", "http", "https"}
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
@@ -62,6 +148,9 @@ ABBREV_COMMON = {
     "lab": "laboratories", "pharma": "pharmaceuticals", "ent": "enterprises",
     "enterprise": "enterprises", "entp": "enterprises", "engg": "engineering", "eng": "engineering",
     "sri": "shri", "shree": "shri", "shre": "shri", "sree": "shri", "doctor": "dr",
+    # branch / phase numerals -> digits, so "Store II" == "Store 2" and the India phonetic
+    # repeat-collapse cannot shrink "ii" into a one-letter typo
+    "ii": "2", "iii": "3", "iv": "4",
     # address words (short canonical forms)
     "street": "st", "str": "st", "avenue": "ave", "av": "ave", "road": "rd", "boulevard": "blvd",
     "blv": "blvd", "bd": "blvd", "drive": "dr", "lane": "ln", "court": "ct", "place": "pl",
@@ -346,7 +435,7 @@ def _parse_address(toks: List[str]):
 
 COLUMNS = ["name_n", "core", "core_toks", "addr_n", "addr_toks", "full", "compact", "initials",
            "first_tok", "meta_first", "sdx_first", "phon", "name_nums", "addr_nums", "postal",
-           "unit", "house", "street", "translit"]
+           "unit", "house", "street", "translit", "legal"]
 
 
 _RE_REPEAT_CHAR = re.compile(r"([a-z])\1+")
@@ -365,9 +454,16 @@ def _india_phonetic(tok: str) -> str:
 def _prep_one(name: str, address: str, country: str):
     ckey = country_key(country)
     nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
+    legal = [is_legal(t) for t in nt]            # before phonetics mangle typos ("lximited")
+    keep = _peel_legal_edges(nt, legal)
+    raw = nt
     if ckey == "india":
         nt = [_india_phonetic(t) for t in nt]
-    ct = [t for t in nt if t not in LEGAL_SUFFIXES] or nt
+    kept = [i for i in keep if not (legal[i] or is_legal(nt[i]))]
+    ct = [nt[i] for i in kept] or nt
+    kept_set = set(kept)
+    lform = canon_legal("".join(raw[i] for i in range(len(raw)) if i not in kept_set
+                                and raw[i] not in _LEGAL_STOP)) if kept else ""
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)
@@ -377,7 +473,7 @@ def _prep_one(name: str, address: str, country: str):
             "".join(x[0] for x in ct) if len(ct) > 1 else "", first, metaphone(first), soundex(first),
             " ".join(sorted(metaphone(x) for x in ct if not _RE_NUM.match(x))),
             [t for t in ct if _RE_NUM.match(t)], nums, postal, unit, house, street,
-            bool(_RE_INDIC.search(name or "")))
+            bool(_RE_INDIC.search(name or "")), lform)
 
 
 def _prep_block(args):
