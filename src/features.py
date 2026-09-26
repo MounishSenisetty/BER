@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, LCSseq
 
 from .blocking import BLOCKERS, CountryIndex, RecordMats, rowwise_dot
 
@@ -171,6 +171,13 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     F["phon_ratio"] = _cp(s1col("phon"), reccol("phon"), fuzz.ratio, n_jobs)
     comp1, comp2 = s1col("compact"), reccol("compact")
     F["compact_jw"] = _cp(comp1, comp2, JaroWinkler.normalized_similarity, n_jobs)
+    # characters on each side not explained by the longest common subsequence: a typo leaves ~1,
+    # a glued branch suffix ("IndustriesII", "burgerii", "Annex") leaves several on one side only
+    lcs = _cp(comp1, comp2, LCSseq.similarity, n_jobs)
+    cl1 = np.fromiter((len(x) for x in comp1), np.float32, len(comp1))
+    cl2 = np.fromiter((len(x) for x in comp2), np.float32, len(comp2))
+    F["compact_extra1"], F["compact_extra2"] = cl1 - lcs, cl2 - lcs
+    F["compact_extra_max"] = np.maximum(cl1, cl2) - lcs
     F["first_jw"] = _cp(s1col("first_tok"), reccol("first_tok"), JaroWinkler.normalized_similarity, n_jobs)
     F["name2_in_addr1"] = np.where(n_empty | (a1 == ""), np.nan, _cp(c2, a1, fuzz.partial_ratio, n_jobs))
 
