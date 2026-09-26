@@ -123,6 +123,7 @@ def main():
     ap.add_argument("--chunk-records", type=int, default=None)
     ap.add_argument("--feature-cache", default=None,
                     help="pickle of the training feature matrix: loaded if it exists, else written")
+    ap.add_argument("--lgb-params", default=None, help='JSON overrides of the LightGBM params, e.g. \'{"num_leaves": 63}\'')
     args = ap.parse_args()
     setup_logging()
     os.makedirs(args.model_dir, exist_ok=True)
@@ -136,6 +137,8 @@ def main():
         cfg.blocking.max_candidates_per_record = args.max_candidates
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
+    if args.lgb_params:
+        cfg.model.params.update(json.loads(args.lgb_params))
 
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
     if split.truth is None:
