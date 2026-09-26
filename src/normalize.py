@@ -69,6 +69,43 @@ def is_legal(tok: str) -> bool:
                for w in _LEGAL_FUZZY if abs(len(w) - len(tok)) <= 2)
 
 
+# legal forms as they appear with broken spacing / typos at either edge of a name:
+# "PvtL td", "PVTLTD", "Pvtc Ltd", "LcLP", "OCRP", "PvtLtd Gupta Jewellers"
+_LEGAL_GLUED = ("pvtltd", "privatelimited", "pvtlimited", "privateltd", "coltd", "ltd", "pvt", "llp",
+                "llc", "inc", "corp", "limited", "private", "incorporated", "corporation", "company", "plc")
+
+
+@lru_cache(maxsize=1_000_000)
+def is_glued_legal(s: str, joined: bool = False) -> bool:
+    """`joined`: s spans several tokens -- one edit at most, so a real neighbouring word is never
+    absorbed ("privatelimited" + "om" is two edits away from "privatelimited")."""
+    if s in _LEGAL_GLUED:
+        return True
+    if len(s) < 4:                               # "inn", "ink" must not become "inc"
+        return False
+    return any(OSA.distance(s, w, score_cutoff=2) <= (2 if len(w) >= 8 and not joined else 1)
+               for w in _LEGAL_GLUED if abs(len(w) - len(s)) <= 2)
+
+
+def _peel_legal_edges(toks: List[str], legal: List[bool], max_join: int = 4) -> List[int]:
+    """Indices of `toks` left after repeatedly removing legal forms (possibly split / glued /
+    mistyped over up to `max_join` tokens) from the end and the start of the name."""
+    idx = list(range(len(toks)))
+    for from_end in (True, False):
+        changed = True
+        while changed and len(idx) > 1:
+            changed = False
+            for k in range(min(max_join, len(idx) - 1), 0, -1):
+                part = idx[-k:] if from_end else idx[:k]
+                if all(legal[i] for i in part) or (
+                        not any(toks[i].isdigit() for i in part)     # branch numbers stay ("II Inc")
+                        and is_glued_legal("".join(toks[i] for i in part), k > 1)):
+                    idx = idx[:-k] if from_end else idx[k:]
+                    changed = True
+                    break
+    return idx
+
+
 WEB_TOKENS = {"www", "http", "https"}
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
@@ -389,9 +426,10 @@ def _prep_one(name: str, address: str, country: str):
     ckey = country_key(country)
     nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
     legal = [is_legal(t) for t in nt]            # before phonetics mangle typos ("lximited")
+    keep = _peel_legal_edges(nt, legal)
     if ckey == "india":
         nt = [_india_phonetic(t) for t in nt]
-    ct = [t for t, lg in zip(nt, legal) if not (lg or is_legal(t))] or nt
+    ct = [nt[i] for i in keep if not (legal[i] or is_legal(nt[i]))] or nt
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)

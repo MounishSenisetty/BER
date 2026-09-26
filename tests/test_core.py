@@ -111,4 +111,8 @@ def test_mistyped_legal_forms_leave_the_core_name():
     from src.normalize import _prep_one, is_legal
     assert _prep_one("Sharma Finance LXIMITED", "", "India")[1] == "sharma finance"
     assert _prep_one("Om Infratech Pvt Ldt", "", "India")[1] == "om infratech"
+    assert _prep_one("Nguyen Restaurant II Incorporated", "", "US")[1] == "nguyen restaurant 2"
+    assert _prep_one("PRIVATE LIMITED OM RAM", "", "India")[1] == "om ram"
+    assert _prep_one("Kumar Construction PvtL td", "", "India")[1] == "kumar construction"
+    assert _prep_one("Holiday Inn", "", "US")[1] == "holiday inn"
     assert not is_legal("limitless") and not is_legal("compact")

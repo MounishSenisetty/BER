@@ -11,3 +11,5 @@ E06c,LightGBM: num_leaves 31; min_child 100; lambda_l2 5,0.99152,0.99133,Reverte
 E06d,LightGBM: E06a with min_child 10,0.99170,0.99154,Reverted,
 E06e,LightGBM: E06a with feature_fraction 0.5,0.99170,0.99146,Reverted,
 E06f,LightGBM: E06a with lr 0.02; lambda_l2 3,0.99170,0.99153,Reverted,
+E07a,Normalise: peel glued/split/mistyped legal forms at name edges (largest-first; <=2 edits even across tokens),0.99170,0.98940,Reverted,"bug: absorbed real neighbours ('II Incorporated' -> dropped branch numeral 2; 'PRIVATE LIMITED OM' -> dropped 'om')"
+E07b,E07a with cross-token joins limited to 1 edit and never absorbing digits,0.99170,0.99189,Kept,"3/5 folds up; OOF logloss 0.00501 -> 0.00487; hold-out flat (0.99114 -> 0.99111); fixes 'PvtL td' / 'PVTLTD' / 'LcLP' / 'OCRP'"
