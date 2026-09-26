@@ -62,6 +62,9 @@ ABBREV_COMMON = {
     "lab": "laboratories", "pharma": "pharmaceuticals", "ent": "enterprises",
     "enterprise": "enterprises", "entp": "enterprises", "engg": "engineering", "eng": "engineering",
     "sri": "shri", "shree": "shri", "shre": "shri", "sree": "shri", "doctor": "dr",
+    # branch / phase numerals -> digits, so "Store II" == "Store 2" and the India phonetic
+    # repeat-collapse cannot shrink "ii" into a one-letter typo
+    "ii": "2", "iii": "3", "iv": "4",
     # address words (short canonical forms)
     "street": "st", "str": "st", "avenue": "ave", "av": "ave", "road": "rd", "boulevard": "blvd",
     "blv": "blvd", "bd": "blvd", "drive": "dr", "lane": "ln", "court": "ct", "place": "pl",

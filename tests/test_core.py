@@ -96,3 +96,12 @@ def test_group_context():
     assert rank.tolist() == [3, 1, 2, 1]
     assert np.allclose(gap[:3], [0.2 - 0.9, 0.9 - 0.5, 0.5 - 0.9])
     assert np.isnan(gap[3])                                        # lone candidate: no competitor
+
+
+def test_branch_numerals_become_digits():
+    from src.normalize import prepare
+    df = pd.DataFrame({"id": ["a", "b"], "name": ["Duga Enterprises II", "Store III"], "address": ["", ""],
+                       "country": ["India", "US"], "source": [2, 2]})
+    out = prepare(df, n_jobs=1)
+    assert out["core_toks"][0] == ["duga", "enterprises", "2"]   # not collapsed to a one-letter "i"
+    assert out["name_nums"][1] == ["3"]
