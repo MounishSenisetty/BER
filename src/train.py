@@ -203,7 +203,7 @@ def main():
     dc = cfg.decision
     best, curve = search_decision(ent, prec, oof, y, n_true_E, dc.modes, dc.exclusive_options, dc.grid)
     curve.to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
-    sel = select(ent, prec, oof, best["mode"], best["threshold"], best["exclusive"], threshold2=best["threshold2"])
+    sel = select(ent, prec, oof, best["mode"], best["threshold"], best["exclusive"])
     single = n_true_E == 0
 
     def breakdown(mask_e):
@@ -224,7 +224,7 @@ def main():
         n_true_other = np.where(ent_fold != f, n_true_E, 0.0)
         b_f, _ = search_decision(ent[~in_f], prec[~in_f], oof[~in_f], y[~in_f], n_true_other,
                                  dc.modes, dc.exclusive_options, dc.grid[::2], verbose=False)
-        sel_f = select(ent, prec, oof, b_f["mode"], b_f["threshold"], b_f["exclusive"], threshold2=b_f["threshold2"])
+        sel_f = select(ent, prec, oof, b_f["mode"], b_f["threshold"], b_f["exclusive"])
         ents_f = ent_fold == f
         n_true_f = np.where(ents_f, n_true_E, 0.0)
         score_all = fast_macro_f05(ent[in_f], sel_f[in_f], y[in_f], n_true_f)
