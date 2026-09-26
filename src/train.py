@@ -18,9 +18,11 @@ Outputs (model-dir):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import pickle
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -29,7 +31,8 @@ from sklearn.model_selection import KFold, StratifiedKFold
 
 from .config import PipelineConfig
 from .features import compute_features
-from .model import resolve_backend, train_fold
+from .model import Ensemble, resolve_backend, train_fold
+from .stage2 import RAW, GroupStats, stage2_frame
 from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
@@ -71,6 +74,9 @@ def main():
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
     ap.add_argument("--backend", choices=["auto", "xgboost", "lightgbm"], default=None)
+    ap.add_argument("--cache-dir", default="/tmp/ber_stage2_cache",
+                    help="scratch space for competitor-pair features (stage 2), ~10 GB on the full data")
+    ap.add_argument("--no-stage2", action="store_true")
     args = ap.parse_args()
     setup_logging()
     os.makedirs(args.model_dir, exist_ok=True)
@@ -95,6 +101,22 @@ def main():
     in_E = sample_entities(n_true, cfg.model.train_entities, cfg.model.seed)
     LOG.info("Training entities: %d of %d (singletons %.1f%%)", in_E.sum(), len(in_E),
              100 * (n_true[in_E] == 0).mean())
+
+    E_rows = np.flatnonzero(in_E)
+    e_local = np.full(len(in_E), -1, dtype=np.int64)
+    e_local[E_rows] = np.arange(len(E_rows))
+    n_true_E = n_true[E_rows]
+    ent_fold = entity_folds(n_true_E, cfg.model.n_folds, cfg.model.seed)
+    fold_of_s1 = np.full(len(in_E), -1, dtype=np.int8)
+    fold_of_s1[E_rows] = ent_fold
+    # fold(s) of the sampled entities each record competes for -> which stage-1 model may score it
+    rec_fmin = np.full(len(split.rec), 127, dtype=np.int8)
+    rec_fmax = np.full(len(split.rec), -1, dtype=np.int8)
+    use_s2 = not args.no_stage2
+    if use_s2:
+        shutil.rmtree(args.cache_dir, ignore_errors=True)
+        os.makedirs(args.cache_dir, exist_ok=True)
+    n_cache = 0
 
     K = cfg.blocking.max_candidates_per_record
     found = np.zeros(len(n_true))
@@ -140,6 +162,14 @@ def main():
         ys.append(y[sub][keep])
         s1s.append(gs1[sub][keep])
         recs.append(grec[sub][keep])
+        gr_e, f_e = grec[sub][keep], fold_of_s1[gs1[sub][keep]]
+        np.minimum.at(rec_fmin, gr_e, f_e)
+        np.maximum.at(rec_fmax, gr_e, f_e)
+        if use_s2 and (~keep).any():     # competitor pairs (other entities) -> disk, scored after stage 1
+            np.save(os.path.join(args.cache_dir, f"X_{n_cache}.npy"), X[~keep].to_numpy(np.float16))
+            np.save(os.path.join(args.cache_dir, f"ids_{n_cache}.npy"),
+                    np.stack([gs1[sub][~keep], grec[sub][~keep]]).astype(np.int64))
+            n_cache += 1
         del X
 
     # ------------------------------------------------------------ blocking report
@@ -172,12 +202,7 @@ def main():
     LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d", len(y), y.sum(), 100 * y.mean(), X.shape[1])
 
     # ------------------------------------------------------------ entity-grouped CV
-    E_rows = np.flatnonzero(in_E)
-    e_local = np.full(len(in_E), -1, dtype=np.int64)
-    e_local[E_rows] = np.arange(len(E_rows))
     ent = e_local[ps1]
-    n_true_E = n_true[E_rows]
-    ent_fold = entity_folds(n_true_E, cfg.model.n_folds, cfg.model.seed)
     pair_fold = ent_fold[ent]
 
     oof = np.zeros(len(y), dtype=np.float64)
@@ -203,51 +228,117 @@ def main():
 
     # ------------------------------------------------------------ decision rule for macro F0.5
     dc = cfg.decision
-    best, curve = search_decision(ent, prec, oof, y, n_true_E, dc.modes, dc.exclusive_options, dc.grid)
-    curve.to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
-    sel = select(ent, prec, oof, best["mode"], best["threshold"], best["exclusive"])
     single = n_true_E == 0
 
-    def breakdown(mask_e):
+    def evaluate(prob, tag):
+        best, curve = search_decision(ent, prec, prob, y, n_true_E, dc.modes, dc.exclusive_options, dc.grid)
+        sel = select(ent, prec, prob, best["mode"], best["threshold"], best["exclusive"])
         E = len(n_true_E)
         tp = np.bincount(ent, weights=(sel & y).astype(float), minlength=E)
         npred = np.bincount(ent, weights=sel.astype(float), minlength=E)
         denom = 0.25 * n_true_E + npred
         fe = np.where(denom > 0, 1.25 * tp / np.maximum(denom, 1e-12), 1.0)
-        return float(fe[mask_e].mean()) if mask_e.any() else float("nan")
+        tuned = {"macro_f05": float(fe.mean()), "singleton_f05": float(fe[single].mean()) if single.any() else float("nan"),
+                 "matched_f05": float(fe[~single].mean())}
+        nested, weights = [], []
+        for f in range(cfg.model.n_folds):
+            in_f = pair_fold == f
+            n_true_other = np.where(ent_fold != f, n_true_E, 0.0)
+            b_f, _ = search_decision(ent[~in_f], prec[~in_f], prob[~in_f], y[~in_f], n_true_other,
+                                     dc.modes, dc.exclusive_options, dc.grid[::2], verbose=False)
+            sel_f = select(ent, prec, prob, b_f["mode"], b_f["threshold"], b_f["exclusive"])
+            ents_f = ent_fold == f
+            n_true_f = np.where(ents_f, n_true_E, 0.0)
+            score_all = fast_macro_f05(ent[in_f], sel_f[in_f], y[in_f], n_true_f)
+            nf = ents_f.sum()   # entities outside fold f score 1 (0/0) in fast_macro_f05 -> rescale
+            nested.append((score_all * E - (E - nf)) / nf)
+            weights.append(nf)
+        nested_score = float(np.average(nested, weights=weights))
+        LOG.info("[%s] OOF (rule tuned on all folds): %s", tag, tuned)
+        LOG.info("[%s] Nested-CV macro F0.5 per fold: %s -> %.5f", tag, np.round(nested, 5).tolist(), nested_score)
+        return {"best": best, "curve": curve, "sel": sel, "tuned": tuned, "nested": nested_score,
+                "nested_per_fold": nested}
 
-    tuned = {"macro_f05": breakdown(np.ones(len(n_true_E), bool)), "singleton_f05": breakdown(single),
-             "matched_f05": breakdown(~single)}
-    LOG.info("OOF (rule tuned on all folds): %s", tuned)
+    feats_all = list(X.columns)
+    ev1 = evaluate(oof, "stage1")
+    final, final_prob, s2_models, s2_features, ev2 = ev1, oof, None, None, None
 
-    nested, weights = [], []
-    for f in range(cfg.model.n_folds):
-        in_f = pair_fold == f
-        n_true_other = np.where(ent_fold != f, n_true_E, 0.0)
-        b_f, _ = search_decision(ent[~in_f], prec[~in_f], oof[~in_f], y[~in_f], n_true_other,
-                                 dc.modes, dc.exclusive_options, dc.grid[::2], verbose=False)
-        sel_f = select(ent, prec, oof, b_f["mode"], b_f["threshold"], b_f["exclusive"])
-        ents_f = ent_fold == f
-        n_true_f = np.where(ents_f, n_true_E, 0.0)
-        score_all = fast_macro_f05(ent[in_f], sel_f[in_f], y[in_f], n_true_f)
-        # fast_macro_f05 averages over all E entities; entities outside fold f score 1 (0/0) -> rescale
-        E, nf = len(n_true_E), ents_f.sum()
-        nested.append((score_all * E - (E - nf)) / nf)
-        weights.append(nf)
-    nested_score = float(np.average(nested, weights=weights))
-    LOG.info("Nested-CV macro F0.5 per fold: %s -> %.5f", np.round(nested, 5).tolist(), nested_score)
+    # ------------------------------------------------------------ stage 2 (competitor-aware re-scoring)
+    if use_s2:
+        import gc
+        feats = list(X.columns)
+        raw_E = {k: X[k].to_numpy(np.float16) for k in RAW}      # float16, exactly as stored at inference
+        n_features = X.shape[1]
+        del X
+        gc.collect()
+        ens_all = Ensemble(models)
+        folds_ens = [Ensemble([m]) for m in models]
+        rf = np.where(rec_fmin == rec_fmax, rec_fmin, -2)      # -2: record spans several folds
+        c_s1, c_rec, c_p, c_raw = [], [], [], {k: [] for k in RAW}
+        with timer(f"Stage 2: scoring {n_cache} cached competitor chunks with the stage-1 fold models"):
+            for i in range(n_cache):
+                Xc = pd.DataFrame(np.load(os.path.join(args.cache_dir, f"X_{i}.npy")).astype(np.float32), columns=feats)
+                ids = np.load(os.path.join(args.cache_dir, f"ids_{i}.npy"))
+                fr = rf[ids[1]]
+                pc = np.empty(len(Xc))
+                for f in np.unique(fr):
+                    m = fr == f
+                    # a model that never saw this record's sampled entity; all folds if it spans several
+                    pc[m] = (folds_ens[f] if f >= 0 else ens_all).predict(Xc[m])
+                c_s1.append(ids[0].astype(np.int32)); c_rec.append(ids[1].astype(np.int32))
+                c_p.append(pc.astype(np.float32))
+                for k in RAW:
+                    c_raw[k].append(Xc[k].to_numpy(np.float16))
+                del Xc
+        shutil.rmtree(args.cache_dir, ignore_errors=True)
+        all_s1 = np.concatenate([ps1.astype(np.int32)] + c_s1).astype(np.int64)
+        all_rec = np.concatenate([prec.astype(np.int32)] + c_rec).astype(np.int64)
+        all_p = np.concatenate([oof.astype(np.float32)] + c_p)
+        raw = {k: np.concatenate([raw_E[k]] + c_raw[k]) for k in RAW}
+        del raw_E
+        LOG.info("Stage 2 universe: %d pairs (%d training pairs + %d competitors)", len(all_p), len(oof), len(all_p) - len(oof))
+        rs = GroupStats(all_rec, all_p, len(split.rec))
+        ss = GroupStats(all_s1, all_p, len(split.s1))
+        X2 = stage2_frame(all_s1, all_rec, all_p, raw, rs, ss, slice(0, len(oof)))
+        del all_s1, all_rec, all_p, raw, rs, ss, c_s1, c_rec, c_p, c_raw
+        s2_features = list(X2.columns)
+        cfg2 = copy.deepcopy(cfg.model)
+        cfg2.num_boost_round, cfg2.early_stopping_rounds = 1500, 50
+        cfg2.params = dict(cfg2.params, num_leaves=63, learning_rate=0.05)
+        oof2 = np.zeros(len(y))
+        s2_models = []
+        for f in range(cfg.model.n_folds):
+            tr, va = pair_fold != f, pair_fold == f
+            with timer(f"Stage 2 fold {f}"):
+                m, oof2[va], _ = train_fold(backend, cfg2, X2[tr], y[tr], X2[va], y[va])
+                LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof2[va], labels=[0, 1]))
+            s2_models.append(m)
+        LOG.info("Stage 2 OOF logloss %.5f (stage 1: %.5f)", log_loss(y, oof2, labels=[0, 1]), oof_ll)
+        ev2 = evaluate(oof2, "stage2")
+        if ev2["nested"] > ev1["nested"]:
+            final, final_prob = ev2, oof2
+        else:
+            LOG.info("Stage 2 did not beat stage 1 on nested CV -> keeping stage 1")
+            s2_models, s2_features = None, None
+    best, sel, tuned, nested_score, nested = (final["best"], final["sel"], final["tuned"], final["nested"],
+                                              final["nested_per_fold"])
+    final["curve"].to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
+    LOG.info("FINAL (%s): nested-CV macro F0.5 %.5f", "stage2" if s2_models else "stage1", nested_score)
 
     pd.DataFrame({"source1_entity_id": split.s1["id"].to_numpy()[ps1], "candidate_entity_id": split.rec["id"].to_numpy()[prec],
-                  "label": y.astype(int), "oof_prob": oof, "fold": pair_fold, "selected": sel.astype(int)}) \
+                  "label": y.astype(int), "oof_prob": oof, "final_prob": final_prob, "fold": pair_fold,
+                  "selected": sel.astype(int)}) \
         .to_csv(os.path.join(args.model_dir, "oof_predictions.tsv"), sep="\t", index=False)
     report = {"blocking": blk, "oof_logloss": oof_ll, "oof_auc": oof_auc, "decision": best,
               "oof_tuned": tuned, "nested_cv_macro_f05": nested_score, "nested_per_fold": nested,
-              "best_iterations": best_iters, "backend": backend, "n_features": X.shape[1],
-              "train_pairs": int(len(y)), "train_entities": int(in_E.sum())}
+              "best_iterations": best_iters, "backend": backend, "n_features": len(feats_all),
+              "train_pairs": int(len(y)), "train_entities": int(in_E.sum()),
+              "stage1_nested_cv_macro_f05": ev1["nested"],
+              "stage2_nested_cv_macro_f05": ev2["nested"] if ev2 else None, "uses_stage2": s2_models is not None}
     with open(os.path.join(args.model_dir, "cv_report.json"), "w") as fh:
         json.dump(report, fh, indent=2, default=float)
-    bundle = {"models": models,
-              "features": list(X.columns), "decision": best, "config": cfg}
+    bundle = {"models": models, "features": feats_all, "decision": best, "config": cfg,
+              "stage2_models": s2_models, "stage2_features": s2_features}
     with open(os.path.join(args.model_dir, "model_bundle.pkl"), "wb") as fh:
         pickle.dump(bundle, fh)
     LOG.info("Saved model bundle to %s", os.path.join(args.model_dir, "model_bundle.pkl"))

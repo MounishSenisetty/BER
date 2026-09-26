@@ -37,6 +37,8 @@ class BlockingConfig:
     addr_keep: int = 2                   # + best-address candidates (trade names / acronyms) ...
     addr_keep_min_cos: float = 0.5       # ... when their address cosine is at least this
     key_keep: int = 2                    # + best key-overlap candidates
+    empty_addr_topk: int = 40            # records with no address: wider name search ...
+    empty_addr_keep: int = 25            # ... and a larger candidate budget
 
 
 @dataclass

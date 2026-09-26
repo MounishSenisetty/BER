@@ -62,18 +62,19 @@ def is_legal(t: str) -> bool:
         return True
     if len(t) < 6 or not t.isalpha() or t in _NOT_LEGAL:
         return False
-    if t.startswith(("priv", "limit", "lmit", "incorp", "corpor")):
+    if t.startswith(("priv", "praiv", "pirai", "limit", "lmit", "incorp", "corpor")):
         return True
     from rapidfuzz.distance import Levenshtein
     k = 1 if len(t) < 8 else 2
     return any(Levenshtein.distance(t, w, score_cutoff=k) <= k for w in _LEGAL_LONG)
 
 
-_RE_LEET = re.compile(r"(?<=[A-Za-z])[01](?=[A-Za-z])")
+_RE_LEET = re.compile(r"(?<=[A-Za-z])[01](?=[A-Za-z])|\b[0156](?=[A-Za-z]{2,})(?!(?:st|nd|rd|th)\b)")
+_LEET = {"0": "o", "1": "l", "5": "s", "6": "g"}
 
 
 def _unleet(m) -> str:
-    return "o" if m.group(0) == "0" else "l"
+    return _LEET[m.group(0)]
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
 ABBREV_COMMON = {
@@ -95,6 +96,12 @@ ABBREV_COMMON = {
     "mount": "mt", "fort": "ft",
     "north": "n", "south": "s", "east": "e", "west": "w", "northeast": "ne", "northwest": "nw",
     "southeast": "se", "southwest": "sw",
+    # ordinal words -> digit ordinals ("531 FIFTEENTH AVE" == "531 15th Avenue")
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th", "sixth": "6th",
+    "seventh": "7th", "eighth": "8th", "ninth": "9th", "tenth": "10th", "eleventh": "11th",
+    "twelfth": "12th", "thirteenth": "13th", "fourteenth": "14th", "fifteenth": "15th",
+    "sixteenth": "16th", "seventeenth": "17th", "eighteenth": "18th", "nineteenth": "19th",
+    "twentieth": "20th", "thirtieth": "30th", "fortieth": "40th", "fiftieth": "50th",
 }
 ABBREV_COUNTRY = {
     "india": {
@@ -272,12 +279,17 @@ def country_key(country: str) -> str:
     return (country or "").strip().lower()
 
 
+_RE_LEAD_ZEROS = re.compile(r"^0+(?=\d)")
+
+
 def tokens(s: str, country: str = "") -> List[str]:
     table = ABBREV_COUNTRY.get(country_key(country))
     out = []
     for t in clean(s).split():
         if t in NULL_TOKENS:
             continue
+        if t[0] == "0":
+            t = _RE_LEAD_ZEROS.sub("", t)          # "002839" -> "2839", "00540k" -> "540k"
         if table is not None and t in table:
             t = table[t]
         else:
@@ -293,7 +305,17 @@ def address_tokens(s: str, country: str = "") -> List[str]:
     if st is not None:
         rx, table = st
         c = rx.sub(lambda m: table[m.group(1)], c)
-    return [t for t in tokens(c, country) if t not in WEB_TOKENS]
+    toks = [t for t in tokens(c, country) if t not in WEB_TOKENS]
+    # drop "PO BOX 4442" / "P O BOX 12": mailing boxes are noise added to street addresses
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] == "box" and out and out[-1] == "po" or (toks[i] == "box" and out[-2:] == ["p", "o"]):
+            out = out[:-1] if out[-1] == "po" else out[:-2]
+            i += 2 if i + 1 < len(toks) and toks[i + 1].isdigit() else 1
+            continue
+        out.append(toks[i])
+        i += 1
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -393,7 +415,8 @@ def _prep_one(name: str, address: str, country: str):
         nt = [_india_phonetic(t) for t in nt]
     if len(nt) > 2 and nt[0] == "m" and nt[1] == "s":            # "M/s Foo Traders"
         nt = nt[2:]
-    ct = [t for t in nt if not is_legal(t) and t not in HONORIFICS] or nt
+    drop = HONORIFICS | ({"pra", "li"} if ckey == "india" else set())    # India: "प्रा. लि." = Pvt. Ltd.
+    ct = [t for t in nt if not is_legal(t) and t not in drop] or nt
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)

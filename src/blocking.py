@@ -315,6 +315,13 @@ class CountryIndex:
         n = len(rc)
 
         r1, s1, k1 = _search(self.name_index, self.name_D, name_D, cfg.name_topk)
+        # records without an address can only be found by name: search much wider for them
+        no_addr = (rc["addr_n"].to_numpy(dtype=object) == "")
+        wide_k = getattr(cfg, "empty_addr_topk", 0)
+        if wide_k > cfg.name_topk and no_addr.any():
+            rows = np.flatnonzero(no_addr)
+            rw, sw, kw = _search(self.name_index, self.name_D, name_D[rows], wide_k)
+            r1, s1, k1 = np.concatenate([r1, rows[rw]]), np.concatenate([s1, sw]), np.concatenate([k1, kw])
         r2, s2, k2 = _search(self.full_index, self.full_D, full_D, cfg.full_topk)
 
         Q = self.hasher.transform(make_keys(rc)).tocsr()
@@ -347,7 +354,7 @@ class CountryIndex:
         cand["b_knn_name"] = (ranks[0] < big).astype(np.int8)
         cand["b_knn_full"] = (ranks[1] < big).astype(np.int8)
         cand["b_key"] = (ranks[2] < big).astype(np.int8)
-        cand["knn_name_rank"] = np.minimum(ranks[0], cfg.name_topk + 1)
+        cand["knn_name_rank"] = np.minimum(ranks[0], max(cfg.name_topk, wide_k) + 1)
         cand["knn_full_rank"] = np.minimum(ranks[1], cfg.full_topk + 1)
         cand["key_rank"] = np.minimum(ranks[2], cfg.key_topk + 1)
         cand["n_blockers"] = (cand["b_knn_name"] + cand["b_knn_full"] + cand["b_key"]).astype(np.int8)
@@ -365,7 +372,9 @@ class CountryIndex:
         rec_arr = cand["rec"].to_numpy()
         cand["cheap_rank"] = _rank_within(rec_arr, cand["cheap"].to_numpy()).astype(np.int16)
         addr_rank = _rank_within(rec_arr, cand["cos_addr_c"].to_numpy())
-        keep = ((cand["cheap_rank"].to_numpy() <= cfg.max_candidates_per_record)
+        cap = np.where(no_addr[rec_arr], getattr(cfg, "empty_addr_keep", cfg.max_candidates_per_record),
+                       cfg.max_candidates_per_record)
+        keep = ((cand["cheap_rank"].to_numpy() <= cap)
                 | ((addr_rank <= cfg.addr_keep) & (cand["cos_addr_c"].to_numpy() >= cfg.addr_keep_min_cos))
                 | (cand["key_rank"].to_numpy() <= cfg.key_keep))
         self.last_union = (rec_arr, cand["s1"].to_numpy())      # pre-cap union (training diagnostics)

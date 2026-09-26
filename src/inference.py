@@ -20,6 +20,7 @@ import pandas as pd
 
 from .features import compute_features
 from .model import Ensemble
+from .stage2 import RAW, predict_in_batches
 from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
 from .postprocess import select
 from .utils import peak_memory_gb, CANDIDATE_HEADER, LOG, MATCHING_HEADER, fast_macro_f05, setup_logging, timer, write_id_lists
@@ -48,17 +49,23 @@ def main():
     LOG.info("Decision rule: mode=%s exclusive=%s threshold=%.3f", rule["mode"], rule["exclusive"], rule["threshold"])
     ens = Ensemble(bundle.get("models") or bundle["boosters"])
     feats = bundle["features"]
+    ens2 = Ensemble(bundle["stage2_models"]) if bundle.get("stage2_models") else None
+    LOG.info("Stage 2 re-scoring: %s", "on" if ens2 else "off")
 
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=args.gt is not None)
     s1_parts, rec_parts, p_parts, cheap_parts = [], [], [], []
+    raw_parts = {k: [] for k in RAW}
     for ch in iter_chunks(split, cfg):
         with timer(f"  features + scoring for {len(ch.cand)} pairs"):
-            X = compute_features(ch.idx, ch.rc, ch.cand, ch.mats, n_jobs=cfg.n_jobs)[feats]
-            p = ens.predict(X)
+            X = compute_features(ch.idx, ch.rc, ch.cand, ch.mats, n_jobs=cfg.n_jobs)
+            p = ens.predict(X[feats])
         s1_parts.append(ch.g_s1.astype(np.int32))
         rec_parts.append(ch.g_rec.astype(np.int32))
         p_parts.append(p.astype(np.float32))
         cheap_parts.append(ch.cand["cheap"].to_numpy(np.float32))
+        if ens2 is not None:
+            for k in RAW:
+                raw_parts[k].append(X[k].to_numpy(np.float16))
         del X
 
     empty_i = np.zeros(0, np.int32)
@@ -69,6 +76,13 @@ def main():
     s1_ids = split.s1["id"].tolist()
     rec_ids = split.rec["id"].to_numpy(dtype=object)
     LOG.info("Scored %d candidate pairs for %d records", len(prob), len(split.rec))
+    if ens2 is not None:
+        raw = {k: np.concatenate(v) for k, v in raw_parts.items()}
+        del raw_parts
+        with timer("Stage 2 re-scoring of all pairs"):
+            prob = predict_in_batches(ens2, ps1.astype(np.int64), prec.astype(np.int64), prob.astype(np.float32),
+                                      raw, len(split.s1), len(split.rec))
+        del raw
 
     with timer("Writing outputs"):
         write_id_lists(os.path.join(args.out_dir, "candidate_pairs.tsv"), CANDIDATE_HEADER, s1_ids,
@@ -79,6 +93,16 @@ def main():
                                     ps1[sel], rec_ids[prec[sel]], order=prob[sel])
     LOG.info("Predicted %d matches for %d / %d Source 1 entities", int(sel.sum()), n_nonempty, len(s1_ids))
     LOG.info("Memory: %s", peak_memory_gb())
+    # per-country summary (the test set contains a country that is absent from training)
+    ctry = split.s1["country"].to_numpy(dtype=object)
+    n_pred = np.bincount(ps1[sel], minlength=len(s1_ids))
+    n_cand = np.bincount(ps1, minlength=len(s1_ids))
+    top = np.zeros(len(s1_ids))
+    np.maximum.at(top, ps1, prob)
+    summ = pd.DataFrame({"country": ctry, "n_pred": n_pred, "n_cand": n_cand, "top_p": top}).groupby("country").agg(
+        entities=("n_pred", "size"), mean_matches=("n_pred", "mean"), empty_rate=("n_pred", lambda v: (v == 0).mean()),
+        mean_candidates=("n_cand", "mean"), mean_top_p=("top_p", "mean"))
+    LOG.info("Per-country predictions:\n%s", summ.round(4).to_string())
 
     if args.dump_scores:
         pd.DataFrame({"source1_entity_id": split.s1["id"].to_numpy()[ps1], "candidate_entity_id": rec_ids[prec],

@@ -96,3 +96,23 @@ def test_group_context():
     assert rank.tolist() == [3, 1, 2, 1]
     assert np.allclose(gap[:3], [0.2 - 0.9, 0.9 - 0.5, 0.5 - 0.9])
     assert np.isnan(gap[3])                                        # lone candidate: no competitor
+
+
+def test_stage2_group_stats():
+    from src.stage2 import GroupStats
+    g = np.array([0, 0, 1, 0])
+    p = np.array([0.2, 0.9, 0.7, 0.6], dtype=np.float32)
+    st = GroupStats(g, p, 3)
+    assert st.rank.tolist() == [3, 1, 1, 2]
+    assert np.isclose(st.top1[0], 0.9) and np.isclose(st.top2[0], 0.6) and np.isnan(st.top2[1])
+    assert st.n.tolist() == [3, 1, 0] and st.c5.tolist() == [2, 1, 0]
+
+
+def test_address_normalisation_real_patterns():
+    from src.normalize import _prep_one, address_tokens
+    assert address_tokens("531 FIFTEENTH AVE, PO BOX 4442, LONGVIEW, WA", "US") == \
+        address_tokens("531 15th Avenue, Longview, WA", "US")
+    assert "2839" in address_tokens("OH, 002839 SEVENTH ST", "US")
+    assert _prep_one("5tar Brothers", "", "India")[1] == "star brothers"
+    assert _prep_one("1st Choice Bakery", "", "US")[1] == "1st choice bakery"
+    assert _prep_one("राज बिल्डर्स प्रा. लि.", "", "India")[1] == "raj bildars"
