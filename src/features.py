@@ -13,19 +13,15 @@ No country label is used as a feature, so the model transfers to unseen countrie
 from __future__ import annotations
 
 import math
-import re
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler, LCSseq, Levenshtein
+from rapidfuzz.distance import JaroWinkler, LCSseq
 
 from .blocking import BLOCKERS, CountryIndex, RecordMats, rowwise_dot
-
-
-_RE_LEAD_INT = re.compile(r"\d+")
 
 
 def _incidence(l1: Sequence[List[str]], l2: Sequence[List[str]]):
@@ -108,16 +104,6 @@ def _group_context(g: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     return rank, gap
 
 
-def _leading_int(a: np.ndarray) -> np.ndarray:
-    """Leading integer of each string ("12a" -> 12), NaN when there is none."""
-    return np.fromiter((float(m.group(0)) if (m := _RE_LEAD_INT.match(x or "")) else np.nan for x in a),
-                       dtype=np.float64, count=len(a))
-
-
-def _prefix(a: np.ndarray, n: int) -> np.ndarray:
-    return np.asarray([x[:n] for x in a], dtype=object)
-
-
 def _objarr(values) -> np.ndarray:
     return np.asarray(list(values) + [None], dtype=object)[:-1]
 
@@ -198,21 +184,8 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     # ---- exact / phonetic / parsed-address flags ------------------------------------------
     F["core_eq"] = (c1 == c2).astype(np.float32)
     F["compact_eq"] = (comp1 == comp2).astype(np.float32)
-    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street", "legal", "street_type"]:
+    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street", "legal"]:
         F[f"{k}_eq"] = _eq_nonempty(s1col(k), reccol(k))
-
-    # ---- address atoms: how far apart, and how many present atoms agree / conflict ---------
-    # (a chain's other branch shares the name but disagrees on house / street / postal)
-    h1, h2 = s1col("house"), reccol("house")
-    F["house_absdiff"] = np.log1p(np.abs(_leading_int(h1) - _leading_int(h2)))
-    p1, p2 = s1col("postal"), reccol("postal")
-    p_miss = (p1 == "") | (p2 == "")
-    F["postal_prefix_eq"] = np.where(p_miss, np.nan, (_prefix(p1, 3) == _prefix(p2, 3)).astype(np.float32))
-    F["postal_lev"] = np.where(p_miss, np.nan, _cp(p1, p2, Levenshtein.distance, n_jobs))
-    atoms = [F[f"{k}_eq"] for k in ("house", "postal", "street", "street_type", "unit")]
-    F["addr_atoms_both"] = sum((~np.isnan(a)).astype(np.float32) for a in atoms)
-    F["addr_atoms_agree"] = sum(np.nan_to_num(a, nan=0.0) for a in atoms)
-    F["addr_atoms_conflict"] = F["addr_atoms_both"] - F["addr_atoms_agree"]
     ini1, ini2 = s1col("initials"), reccol("initials")
     F["acronym"] = (((ini1 != "") & (ini1 == comp2)) | ((ini2 != "") & (ini2 == comp1))).astype(np.float32)
 

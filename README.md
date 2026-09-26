@@ -23,6 +23,8 @@ python -m src.train     --data-dir $DATA/train --model-dir models             # 
 python -m src.inference --data-dir $DATA/test  --model-dir models --out-dir output
 python $DATA/../utils/validate_submission.py --matching output/matching_results.tsv \
        --candidate output/candidate_pairs.tsv --test-dir $DATA/test
+python scripts/check_submission.py --matching output/matching_results.tsv \
+       --candidate output/candidate_pairs.tsv --test-dir $DATA/test                 # local check, PASS / exit 0
 python scripts/make_submission_zip.py --team <team> --out-dir output --doc Documentation_template.md
 ```
 
@@ -35,7 +37,9 @@ Useful flags:
 - `--chunk-records N`: records per chunk; lower it if memory is tight.
 - `--feature-cache PATH`: save the training feature matrix (or load it if it exists), so model and
   decision experiments skip blocking and features.
-- `--lgb-params JSON`: override LightGBM params, e.g. `'{"num_leaves": 63}'`.
+- `--lgb-params JSON`: override LightGBM params, e.g. `'{"num_leaves": 63}'` or `'{"device_type": "gpu"}'`.
+- `--seed N`: seed for the entity sample, folds, SVD/FAISS and LightGBM. Experiments are compared on the
+  mean over seeds 42, 7 and 2026, because a single seed moves CV by about ±0.00015.
 
 Error analysis and experiment log:
 - `python scripts/error_analysis.py --data-dir $DATA/train --model-dir models` buckets the worst OOF
@@ -72,7 +76,7 @@ src/postprocess.py  expected-F0.5 subset selection / threshold, OOF rule search
 src/pipeline.py     streaming driver: country partitions x record chunks (bounded memory)
 src/train.py        full-split blocking, sampled-entity features, entity-grouped CV, nested threshold tuning
 src/inference.py    writes candidate_pairs.tsv + matching_results.tsv
-scripts/            eda.py, make_synthetic_data.py, make_submission_zip.py
+scripts/            eda.py, error_analysis.py, check_submission.py, make_synthetic_data.py, make_submission_zip.py
 tests/test_core.py  metric, decision layer, normalisation, output format
 ```
 
