@@ -1,0 +1,3 @@
+Experiment_ID,Modification,Baseline_CV,New_CV,Decision,Notes
+E00,Baseline (synthetic train 20k S1; 5-fold entity-grouped stratified CV; nested decision tuning),,0.99035,Baseline,"hold-out 0.98956; blocking ceiling 0.9992; OOF AUC 0.99988; loss 193 units: 156 FN-only (87% of FN pairs are name-only records), 37 FP"
+E01,Decision: separate thresholds for entity top-1 vs other candidates (+ record exclusivity),0.99052,0.99056,Reverted,"+0.00004 vs global threshold under identical nested protocol = noise; plain threshold / expected_f / exclusivity all tie at t=0.80"
