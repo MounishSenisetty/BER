@@ -116,3 +116,12 @@ def test_mistyped_legal_forms_leave_the_core_name():
     assert _prep_one("Kumar Construction PvtL td", "", "India")[1] == "kumar construction"
     assert _prep_one("Holiday Inn", "", "US")[1] == "holiday inn"
     assert not is_legal("limitless") and not is_legal("compact")
+
+
+def test_canonical_legal_form():
+    from src.normalize import COLUMNS, _prep_one
+    li = COLUMNS.index("legal")
+    assert _prep_one("Ram Traders Private (Limited)", "", "India")[li] == "pvtltd"
+    assert _prep_one("राम ट्रेडर्स प्राइवेट लिमिटेड", "", "India")[li] == "pvtltd"
+    assert _prep_one("Green Logistics Inc.", "", "US")[li] == "inc"
+    assert _prep_one("Sunny Burger", "", "US")[li] == ""

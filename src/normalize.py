@@ -106,6 +106,35 @@ def _peel_legal_edges(toks: List[str], legal: List[bool], max_join: int = 4) -> 
     return idx
 
 
+# canonical legal form of a name ("Pvt. Ltd." / "Private (Limited)" / "PvtL td" -> pvtltd): two S1
+# entities with the same core name are often told apart only by it ("... LLC" vs "... Inc")
+_LEGAL_CANON = {
+    "inc": "inc", "incorporated": "inc", "corp": "corp", "corporation": "corp", "co": "co",
+    "company": "co", "kampani": "co", "ltd": "ltd", "limited": "ltd", "limitd": "ltd", "coltd": "ltd",
+    "pvt": "pvtltd", "pvtltd": "pvtltd", "privatelimited": "pvtltd", "pvtlimited": "pvtltd",
+    "privateltd": "pvtltd", "praivetlimitd": "pvtltd", "privetlimitd": "pvtltd", "llc": "llc", "llp": "llp",
+    "elelpi": "llp", "elaelapi": "llp", "elelapi": "llp", "plc": "plc", "pllc": "pllc", "sarl": "sarl",
+    "sas": "sas", "sasu": "sasu", "eurl": "eurl", "sa": "sa", "sci": "sci", "snc": "snc", "gmbh": "gmbh",
+}
+_LEGAL_STOP = {"the", "and", "of", "et", "de", "du", "des", "la", "le", "les", "dba"}
+
+
+@lru_cache(maxsize=1_000_000)
+def canon_legal(s: str) -> str:
+    """Joined removed-legal tokens -> canonical form; '' when absent or unrecognisable."""
+    if not s or s in _LEGAL_CANON:
+        return _LEGAL_CANON.get(s, "")
+    if len(s) < 4:
+        return ""
+    best, dist = "", 3
+    for k, v in _LEGAL_CANON.items():
+        if abs(len(k) - len(s)) <= 2 and len(k) >= 3:
+            d = OSA.distance(s, k, score_cutoff=2)
+            if d < dist and d <= (2 if len(k) >= 8 else 1):
+                best, dist = v, d
+    return best
+
+
 WEB_TOKENS = {"www", "http", "https"}
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
@@ -406,7 +435,7 @@ def _parse_address(toks: List[str]):
 
 COLUMNS = ["name_n", "core", "core_toks", "addr_n", "addr_toks", "full", "compact", "initials",
            "first_tok", "meta_first", "sdx_first", "phon", "name_nums", "addr_nums", "postal",
-           "unit", "house", "street", "translit"]
+           "unit", "house", "street", "translit", "legal"]
 
 
 _RE_REPEAT_CHAR = re.compile(r"([a-z])\1+")
@@ -427,9 +456,14 @@ def _prep_one(name: str, address: str, country: str):
     nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
     legal = [is_legal(t) for t in nt]            # before phonetics mangle typos ("lximited")
     keep = _peel_legal_edges(nt, legal)
+    raw = nt
     if ckey == "india":
         nt = [_india_phonetic(t) for t in nt]
-    ct = [nt[i] for i in keep if not (legal[i] or is_legal(nt[i]))] or nt
+    kept = [i for i in keep if not (legal[i] or is_legal(nt[i]))]
+    ct = [nt[i] for i in kept] or nt
+    kept_set = set(kept)
+    lform = canon_legal("".join(raw[i] for i in range(len(raw)) if i not in kept_set
+                                and raw[i] not in _LEGAL_STOP)) if kept else ""
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)
@@ -439,7 +473,7 @@ def _prep_one(name: str, address: str, country: str):
             "".join(x[0] for x in ct) if len(ct) > 1 else "", first, metaphone(first), soundex(first),
             " ".join(sorted(metaphone(x) for x in ct if not _RE_NUM.match(x))),
             [t for t in ct if _RE_NUM.match(t)], nums, postal, unit, house, street,
-            bool(_RE_INDIC.search(name or "")))
+            bool(_RE_INDIC.search(name or "")), lform)
 
 
 def _prep_block(args):

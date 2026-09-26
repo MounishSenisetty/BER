@@ -184,7 +184,7 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     # ---- exact / phonetic / parsed-address flags ------------------------------------------
     F["core_eq"] = (c1 == c2).astype(np.float32)
     F["compact_eq"] = (comp1 == comp2).astype(np.float32)
-    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street"]:
+    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street", "legal"]:
         F[f"{k}_eq"] = _eq_nonempty(s1col(k), reccol(k))
     ini1, ini2 = s1col("initials"), reccol("initials")
     F["acronym"] = (((ini1 != "") & (ini1 == comp2)) | ((ini2 != "") & (ini2 == comp1))).astype(np.float32)
@@ -216,7 +216,7 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     F["n_cand_rec"] = cand.groupby("rec")["s1"].transform("size").to_numpy().astype(np.float32)
     F["combo"] = (0.4 * F["cos_full_c"] + 0.3 * np.nan_to_num(F["tok_full_wjac"])
                   + 0.3 * np.nan_to_num(F["name_tset"]) / 100).astype(np.float32)
-    for sname in ["combo", "cos_name_c", "cos_full_c", "name_tset", "key_score", "cheap"]:
+    for sname in ["combo", "cos_name_c", "cos_full_c", "name_tset", "key_score", "cheap", "name_full_ratio"]:
         x = np.nan_to_num(np.asarray(F[sname], dtype=np.float32))
         F[f"{sname}_rank_rec"], F[f"{sname}_gap_rec"] = _group_context(ib, x)
 
