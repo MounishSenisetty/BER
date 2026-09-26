@@ -118,6 +118,7 @@ def main():
     ap.add_argument("--model-dir", default="models")
     ap.add_argument("--s1"), ap.add_argument("--s2"), ap.add_argument("--s3"), ap.add_argument("--gt")
     ap.add_argument("--folds", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None, help="seed for entity sample, folds and LightGBM")
     ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
@@ -131,6 +132,8 @@ def main():
     cfg = PipelineConfig()
     if args.folds:
         cfg.model.n_folds = args.folds
+    if args.seed is not None:
+        cfg.model.seed = args.seed
     if args.train_entities is not None:
         cfg.model.train_entities = args.train_entities
     if args.max_candidates:
