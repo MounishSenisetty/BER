@@ -37,7 +37,7 @@ from .cross_encoder import CEConfig, assemble, ce_features, config_dict, encode_
 from .diagnostics import loss_report
 from .lexicon import learn_from_split
 from .normalize import set_lexicon
-from .pipeline import auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
+from .pipeline import restrict_countries, auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
 
@@ -124,6 +124,7 @@ def main():
                     help="fraction of training Source 1 entities to drop so their records become distractors "
                          "(default: auto from the test split's records-per-entity ratio; 0 = off)")
     ap.add_argument("--no-lexicon", action="store_true", help="do not learn the transliteration lexicon")
+    ap.add_argument("--countries", default=None, help="comma-separated country labels to train on (quick experiments)")
     ap.add_argument("--cross-encoder", choices=["auto", "on", "off"], default="auto",
                     help="char-level transformer cross-encoder as a stage-2 feature (auto = only with a CUDA GPU)")
     ap.add_argument("--ce-epochs", type=float, default=None)
@@ -150,6 +151,9 @@ def main():
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
     if split.truth is None:
         raise SystemExit("Training needs a ground-truth file (--gt)")
+    if args.countries:
+        keep_c = {c.strip().lower() for c in args.countries.split(",")}
+        split = restrict_countries(split, keep_c)
     lexicon = {}
     if not args.no_lexicon:
         with timer("Learning the transliteration lexicon"):
