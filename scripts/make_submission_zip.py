@@ -21,7 +21,7 @@ from importlib import metadata
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PACKAGES = ["numpy", "pandas", "scipy", "scikit-learn", "lightgbm", "xgboost", "rapidfuzz", "faiss-cpu", "faiss-gpu-cu12", "joblib",
-            "jellyfish", "torch"]
+            "jellyfish", "torch", "transformers", "sentencepiece"]
 
 
 def pinned_requirements() -> str:
@@ -30,7 +30,7 @@ def pinned_requirements() -> str:
         try:
             lines.append(f"{p}=={metadata.version(p)}")
         except metadata.PackageNotFoundError:
-            if p not in ("jellyfish", "faiss-cpu", "faiss-gpu-cu12", "xgboost", "torch"):  # optional / either-or
+            if p not in ("jellyfish", "faiss-cpu", "faiss-gpu-cu12", "xgboost", "torch", "transformers", "sentencepiece"):  # optional / either-or
                 lines.append(p)
     return "\n".join(lines) + "\n"
 

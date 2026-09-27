@@ -130,6 +130,11 @@ def main():
     ap.add_argument("--ce-epochs", type=float, default=None)
     ap.add_argument("--ce-max-train-pairs", type=int, default=None)
     ap.add_argument("--ce-small", action="store_true", help="tiny cross-encoder (CPU smoke tests)")
+    ap.add_argument("--ce-backbone", default="",
+                    help="fine-tune a pretrained Hugging Face model as the cross-encoder instead of the from-scratch "
+                         "character model, e.g. microsoft/deberta-v3-small or intfloat/multilingual-e5-small "
+                         "(both MIT; a local path works offline)")
+    ap.add_argument("--ce-max-len", type=int, default=None, help="token budget per pair for --ce-backbone (default 96)")
     ap.add_argument("--final", choices=["auto", "stage1", "stage2", "stage2+ce"], default="auto",
                     help="model variant to ship (auto = best nested-CV macro F0.5)")
     args = ap.parse_args()
@@ -182,6 +187,12 @@ def main():
     rec_fmax = np.full(len(split.rec), -1, dtype=np.int8)
     use_s2 = not args.no_stage2
     ce_cfg = CEConfig(seed=cfg.model.seed)
+    if args.ce_backbone:                   # fine-tuning recipe for a pretrained backbone
+        ce_cfg.backbone = args.ce_backbone
+        ce_cfg.lr, ce_cfg.batch_size, ce_cfg.epochs, ce_cfg.warmup_steps = 3e-5, 64, 1.0, 300
+        ce_cfg.max_train_pairs = 600_000
+        if args.ce_max_len:
+            ce_cfg.max_len = args.ce_max_len
     if args.ce_epochs:
         ce_cfg.epochs = args.ce_epochs
     if args.ce_max_train_pairs:
@@ -191,7 +202,8 @@ def main():
         ce_cfg.name_len, ce_cfg.addr_len, ce_cfg.warmup_steps = 32, 48, 50
     dev = torch_device()
     use_ce = use_s2 and (args.cross_encoder == "on" and dev != "none" or args.cross_encoder == "auto" and dev == "cuda")
-    LOG.info("Cross-encoder: %s (torch device: %s)", "on" if use_ce else "off", dev)
+    LOG.info("Cross-encoder: %s (torch device: %s, backbone: %s)", "on" if use_ce else "off", dev,
+             ce_cfg.backbone or "char transformer from scratch")
     if use_s2:
         shutil.rmtree(args.cache_dir, ignore_errors=True)
         os.makedirs(args.cache_dir, exist_ok=True)

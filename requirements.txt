@@ -9,3 +9,5 @@ joblib>=1.2
 jellyfish>=1.0
 xgboost>=2.0
 torch>=2.1                # optional: cross-encoder (preinstalled on Kaggle GPU images)
+transformers>=4.40          # optional: pretrained cross-encoder backbone (--ce-backbone)
+sentencepiece>=0.1.99       # optional: tokenizer of DeBERTa-v3 backbones
