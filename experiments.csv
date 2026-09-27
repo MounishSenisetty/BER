@@ -1,0 +1,18 @@
+Experiment_ID,Modification,Baseline_CV,New_CV,Decision,Notes
+E00,Baseline (synthetic train 20k S1; 5-fold entity-grouped stratified CV; nested decision tuning),,0.99035,Baseline,"hold-out 0.98956; blocking ceiling 0.9992; OOF AUC 0.99988; loss 193 units: 156 FN-only (87% of FN pairs are name-only records), 37 FP"
+E01,Decision: separate thresholds for entity top-1 vs other candidates (+ record exclusivity),0.99052,0.99056,Reverted,"+0.00004 vs global threshold under identical nested protocol = noise; plain threshold / expected_f / exclusivity all tie at t=0.80"
+E02,Features: LCS-unexplained chars on compact name (compact_extra1/2/max),0.99035,0.99058,Kept,"4/5 folds up; hold-out 0.98956 -> 0.98974; targets glued branch suffixes (IndustriesII / burgerii)"
+E03,Model: stage-2 GBM on stage-1 probability context (rank/gap/mass within record & entity; leak-free nested fold-pair stage-1 models),0.99059,0.99070,Reverted,"+0.0001 = noise vs same-protocol stage-1; combo_gap_rec already carries record context; not worth 15 extra models"
+E04,Normalise: roman branch numerals ii/iii/iv -> digits (India repeat-collapse turned II into a 1-letter typo),0.99058,0.99116,Kept,"4/5 folds up; OOF logloss 0.00553 -> 0.00534; hold-out 0.98974 -> 0.99044"
+E05,Normalise: fuzzy legal-form removal (OSA<=1/2 to limited/private/company/corporation/incorporated/...; ltd/pvt anagrams; checked before India phonetics),0.99116,0.99152,Kept,"4/5 folds up; OOF logloss 0.00534 -> 0.00521; hold-out 0.99044 -> 0.99117"
+E06a,LightGBM: lr 0.05->0.03; num_leaves 127->63; min_child_samples 50->20,0.99152,0.99170,Kept,"all 5 folds up; OOF logloss 0.00521 -> 0.00501; hold-out flat (0.99117 -> 0.99114)"
+E06b,LightGBM: num_leaves 255; min_child 20; feature_fraction 0.6,0.99152,0.99132,Reverted,
+E06c,LightGBM: num_leaves 31; min_child 100; lambda_l2 5,0.99152,0.99133,Reverted,"best logloss (0.00491) but worse F0.5"
+E06d,LightGBM: E06a with min_child 10,0.99170,0.99154,Reverted,
+E06e,LightGBM: E06a with feature_fraction 0.5,0.99170,0.99146,Reverted,
+E06f,LightGBM: E06a with lr 0.02; lambda_l2 3,0.99170,0.99153,Reverted,
+E07a,Normalise: peel glued/split/mistyped legal forms at name edges (largest-first; <=2 edits even across tokens),0.99170,0.98940,Reverted,"bug: absorbed real neighbours ('II Incorporated' -> dropped branch numeral 2; 'PRIVATE LIMITED OM' -> dropped 'om')"
+E07b,E07a with cross-token joins limited to 1 edit and never absorbing digits,0.99170,0.99189,Kept,"3/5 folds up; OOF logloss 0.00501 -> 0.00487; hold-out flat (0.99114 -> 0.99111); fixes 'PvtL td' / 'PVTLTD' / 'LcLP' / 'OCRP'"
+E08,Ensemble: XGBoost / CatBoost OOF blends and LGBM 3-seed bagging,0.99189,0.99207,Reverted,"best lgb+xgb 50/50 = +0.00018 but single-seed LGBM already varies 0.99189-0.99205 (seed noise +-0.00015); seed-bag x3 0.99191. Noise floor established: decisions below use 3-seed mean. E07b re-checked: 3-seed 0.99167 -> 0.99198 (robust)"
+E09,Features: canonical legal form per name (fuzzy; pvtltd/llc/inc/...) -> legal_eq + name_full_ratio record-context,0.99198 (3-seed),0.99208 (3-seed),Kept,"OOF logloss 0.00487 -> 0.00438 (AUC 0.99990 -> 0.99992); hold-out 0.99111 -> 0.99161; separates same-name S1 entities (LLC vs Inc). Decision variants re-tested: still tie"
+E10,Features: name+legal agreement score (compact_jw + legal_eq) with record rank/gap,0.99208 (3-seed),0.99204 (3-seed),Reverted,"logloss 0.00438 -> 0.00433 but F0.5 flat/down; information already captured by legal_eq + name_full_ratio_gap_rec"

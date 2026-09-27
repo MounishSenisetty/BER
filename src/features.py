@@ -13,15 +13,19 @@ No country label is used as a feature, so the model transfers to unseen countrie
 from __future__ import annotations
 
 import math
+import re
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, LCSseq, Levenshtein
 
 from .blocking import BLOCKERS, CountryIndex, RecordMats, rowwise_dot
+
+
+_RE_LEAD_INT = re.compile(r"\d+")
 
 
 def _incidence(l1: Sequence[List[str]], l2: Sequence[List[str]]):
@@ -104,6 +108,16 @@ def _group_context(g: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     return rank, gap
 
 
+def _leading_int(a: np.ndarray) -> np.ndarray:
+    """Leading integer of each string ("12a" -> 12), NaN when there is none."""
+    return np.fromiter((float(m.group(0)) if (m := _RE_LEAD_INT.match(x or "")) else np.nan for x in a),
+                       dtype=np.float64, count=len(a))
+
+
+def _prefix(a: np.ndarray, n: int) -> np.ndarray:
+    return np.asarray([x[:n] for x in a], dtype=object)
+
+
 def _objarr(values) -> np.ndarray:
     return np.asarray(list(values) + [None], dtype=object)[:-1]
 
@@ -172,14 +186,34 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     F["phon_ratio"] = _cp(s1col("phon"), reccol("phon"), fuzz.ratio, n_jobs)
     comp1, comp2 = s1col("compact"), reccol("compact")
     F["compact_jw"] = _cp(comp1, comp2, JaroWinkler.normalized_similarity, n_jobs)
+    # characters on each side not explained by the longest common subsequence: a typo leaves ~1,
+    # a glued branch suffix ("IndustriesII", "burgerii", "Annex") leaves several on one side only
+    lcs = _cp(comp1, comp2, LCSseq.similarity, n_jobs)
+    cl1 = np.fromiter((len(x) for x in comp1), np.float32, len(comp1))
+    cl2 = np.fromiter((len(x) for x in comp2), np.float32, len(comp2))
+    F["compact_extra1"], F["compact_extra2"] = cl1 - lcs, cl2 - lcs
+    F["compact_extra_max"] = np.maximum(cl1, cl2) - lcs
     F["first_jw"] = _cp(s1col("first_tok"), reccol("first_tok"), JaroWinkler.normalized_similarity, n_jobs)
     F["name2_in_addr1"] = np.where(n_empty | (a1 == ""), np.nan, _cp(c2, a1, fuzz.partial_ratio, n_jobs))
 
     # ---- exact / phonetic / parsed-address flags ------------------------------------------
     F["core_eq"] = (c1 == c2).astype(np.float32)
     F["compact_eq"] = (comp1 == comp2).astype(np.float32)
-    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street"]:
+    for k in ["first_tok", "meta_first", "sdx_first", "house", "postal", "unit", "street", "legal", "street_type"]:
         F[f"{k}_eq"] = _eq_nonempty(s1col(k), reccol(k))
+
+    # ---- address atoms: how far apart, and how many present atoms agree / conflict ---------
+    # (a chain's other branch shares the name but disagrees on house / street / postal)
+    h1, h2 = s1col("house"), reccol("house")
+    F["house_absdiff"] = np.log1p(np.abs(_leading_int(h1) - _leading_int(h2)))
+    p1, p2 = s1col("postal"), reccol("postal")
+    p_miss = (p1 == "") | (p2 == "")
+    F["postal_prefix_eq"] = np.where(p_miss, np.nan, (_prefix(p1, 3) == _prefix(p2, 3)).astype(np.float32))
+    F["postal_lev"] = np.where(p_miss, np.nan, _cp(p1, p2, Levenshtein.distance, n_jobs))
+    atoms = [F[f"{k}_eq"] for k in ("house", "postal", "street", "street_type", "unit")]
+    F["addr_atoms_both"] = sum((~np.isnan(a)).astype(np.float32) for a in atoms)
+    F["addr_atoms_agree"] = sum(np.nan_to_num(a, nan=0.0) for a in atoms)
+    F["addr_atoms_conflict"] = F["addr_atoms_both"] - F["addr_atoms_agree"]
     ini1, ini2 = s1col("initials"), reccol("initials")
     F["acronym"] = (((ini1 != "") & (ini1 == comp2)) | ((ini2 != "") & (ini2 == comp1))).astype(np.float32)
 
@@ -210,7 +244,7 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     F["n_cand_rec"] = cand.groupby("rec")["s1"].transform("size").to_numpy().astype(np.float32)
     F["combo"] = (0.4 * F["cos_full_c"] + 0.3 * np.nan_to_num(F["tok_full_wjac"])
                   + 0.3 * np.nan_to_num(F["name_tset"]) / 100).astype(np.float32)
-    for sname in ["combo", "cos_name_c", "cos_full_c", "name_tset", "key_score", "cheap"]:
+    for sname in ["combo", "cos_name_c", "cos_full_c", "name_tset", "key_score", "cheap", "name_full_ratio"]:
         x = np.nan_to_num(np.asarray(F[sname], dtype=np.float32))
         F[f"{sname}_rank_rec"], F[f"{sname}_gap_rec"] = _group_context(ib, x)
 

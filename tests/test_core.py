@@ -116,3 +116,67 @@ def test_address_normalisation_real_patterns():
     assert _prep_one("5tar Brothers", "", "India")[1] == "star brothers"
     assert _prep_one("1st Choice Bakery", "", "US")[1] == "1st choice bakery"
     assert _prep_one("राज बिल्डर्स प्रा. लि.", "", "India")[1] == "raj bildars"
+
+
+def test_branch_numerals_become_digits():
+    from src.normalize import prepare
+    df = pd.DataFrame({"id": ["a", "b"], "name": ["Duga Enterprises II", "Store III"], "address": ["", ""],
+                       "country": ["India", "US"], "source": [2, 2]})
+    out = prepare(df, n_jobs=1)
+    assert out["core_toks"][0] == ["duga", "enterprises", "2"]   # not collapsed to a one-letter "i"
+    assert out["name_nums"][1] == ["3"]
+
+
+def test_mistyped_legal_forms_leave_the_core_name():
+    from src.normalize import _prep_one, is_legal
+    assert _prep_one("Sharma Finance LXIMITED", "", "India")[1] == "sharma finance"
+    assert _prep_one("Om Infratech Pvt Ldt", "", "India")[1] == "om infratech"
+    assert _prep_one("Nguyen Restaurant II Incorporated", "", "US")[1] == "nguyen restaurant 2"
+    assert _prep_one("PRIVATE LIMITED OM RAM", "", "India")[1] == "om ram"
+    assert _prep_one("Kumar Construction PvtL td", "", "India")[1] == "kumar construction"
+    assert _prep_one("Holiday Inn", "", "US")[1] == "holiday inn"
+    assert not is_legal("limitless") and not is_legal("compact")
+
+
+def test_canonical_legal_form():
+    from src.normalize import COLUMNS, _prep_one
+    li = COLUMNS.index("legal")
+    assert _prep_one("Ram Traders Private (Limited)", "", "India")[li] == "pvtltd"
+    assert _prep_one("राम ट्रेडर्स प्राइवेट लिमिटेड", "", "India")[li] == "pvtltd"
+    assert _prep_one("Green Logistics Inc.", "", "US")[li] == "inc"
+    assert _prep_one("Sunny Burger", "", "US")[li] == ""
+
+
+def test_french_abbreviations_meet_the_shared_canonical_form():
+    from src.normalize import COLUMNS, _prep_one
+    C = {c: i for i, c in enumerate(COLUMNS)}
+    a = _prep_one("x", "213 Place Jean Jaures, 33276 La Teste", "France")
+    b = _prep_one("x", "213 PL. JEAN JAURES, 33276 LA TESTE", "France")
+    assert a[C["addr_n"]] == b[C["addr_n"]]
+    assert (a[C["house"]], a[C["street"]], a[C["street_type"]], a[C["postal"]]) == ("213", "jean", "pl", "33276")
+    # "bis" belongs to the house number; CEDEX / BP routing codes are not address atoms
+    r = _prep_one("x", "20 bis Bd de la Paix BP 1234 75008 Paris Cedex 08", "France")
+    assert (r[C["house"]], r[C["street"]], r[C["street_type"]], r[C["postal"]]) == ("20", "paix", "blvd", "75008")
+
+
+def test_mistyped_french_legal_forms_only_in_france():
+    from src.normalize import COLUMNS, _prep_one
+    li = COLUMNS.index("legal")
+    assert _prep_one("PROVENCE AGENCE S..S", "", "France")[1] == "provence agence"
+    assert _prep_one("Agence Lumiere sSCI", "", "France")[1:2] + (_prep_one("Agence Lumiere sSCI", "", "France")[li],) \
+        == ("agence lumiere", "sci")
+    assert _prep_one("Pharmacie Agence EUvRL", "", "France")[1] == "pharmacie agence"
+    assert _prep_one("Blue Seas", "", "US")[1] == "blue seas"          # one edit from "sas", but not France
+    assert _prep_one("Data Sync", "", "US")[1] == "data sync"
+
+
+def test_house_number_is_anchored_on_the_street_type():
+    from src.normalize import COLUMNS, _prep_one
+    C = {c: i for i, c in enumerate(COLUMNS)}
+    for addr in ("MD 21251, Dundalk, 10290 Fawn Avenue", "10290 Fawn Ave, Dundalk, MD 21251"):
+        r = _prep_one("x", addr, "US")
+        assert (r[C["house"]], r[C["street"]], r[C["postal"]]) == ("10290", "fawn", "21251")
+    r = _prep_one("x", "500 E 5th Ave Ste 200, Phoenix AZ 85001", "US")
+    assert (r[C["house"]], r[C["street"]], r[C["unit"]]) == ("500", "5th", "200")
+    r = _prep_one("x", "H.No 962, Gulmohar Colony, Mumbai, Maharashtra 400502", "India")
+    assert (r[C["house"]], r[C["postal"]]) == ("962", "400502")
