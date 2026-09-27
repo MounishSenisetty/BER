@@ -241,7 +241,33 @@ loss is priced in. The chosen floor is the median of the near-optimal plateau.
 | Version | Candidate recall | F0.5 ceiling | Nested-CV macro F0.5 |
 |---|---|---|---|
 | v1: name/full FAISS + name keys, LightGBM | 92.22 % | 0.9712 | 0.9493 |
-| **v2 (final)**: + address-pair and acronym keys, address/key specialist slots, misspelt-legal-form handling, XGBoost-GPU | **97.25 %** | **0.9905** | **0.9681** |
+| v2: + address-pair and acronym keys, address/key specialist slots, misspelt-legal-form handling, XGBoost-GPU | 97.25 % | 0.9905 | 0.9681 |
+| v2.1: + stage-2 competitor-aware re-scoring, wider search for address-less records | 97.58 % | 0.9916 | 0.9718 |
+| **v3**: + learned transliteration lexicon, address kNN generator, name x locality keys, test-like S1 dropout, legal-form peeling, char transformer cross-encoder in stage 2 | *[fill]* | *[fill]* | *[fill]* (not comparable: S1 dropout makes CV harder, like test) |
+
+**v3 changes in detail:**
+
+- **Test-like training distribution (S1 dropout).** The test split has 5.75 Source 2/3 records per
+  Source 1 entity against 4.68 in train, while matches per entity are the same (3.46 in train; 3.34
+  predicted on test). So about 40 % of test records are distractors, against 26 % in train. Training
+  now drops a random 19 % of its Source 1 entities (sized from the two splits' row counts), and
+  their records become distractors. The model and the decision threshold then see the test-time
+  prior and the test-time density of look-alike competitors.
+- **Learned transliteration lexicon (`src/lexicon.py`).** Native-script names are mostly *English*
+  words spelled phonetically (`সফটওয়্যার` = Software), which rule transliteration cannot undo. From
+  every matched (native-script record, Latin Source 1) pair, native tokens are aligned to Latin
+  tokens with a monotone DP (1:1 or 1:2, Jaro-Winkler on phonetic forms). A mapping is kept when
+  at least 3 distinct entities support it, so it never encodes a single entity's label. Known
+  native words are replaced before rule transliteration, for names and addresses alike.
+- **Address kNN generator** (FAISS on SVD of the address char-TF-IDF) and **name x locality keys**
+  (compact name / first token x each place word of the address). These recover trade names,
+  domains and generic names that the name-dominated generators rank out.
+- **Cross-encoder (`src/cross_encoder.py`).** A 4-layer character transformer reads
+  `[CLS] s1 name | s1 address | record name | record address` jointly. It is trained from scratch
+  (no pretrained weights) on positives and hard negatives, as two models on disjoint halves of the
+  entity folds, so every training pair gets an out-of-fold score. Its logit, and its rank and
+  margin within the record and within the entity, are added to stage 2. It is kept only if it
+  beats stage 2 without it on nested CV.
 
 - **Format.** Outputs pass `utils/validate_submission.py`, including the `--check-ids` option on
   `matching_results.tsv`.

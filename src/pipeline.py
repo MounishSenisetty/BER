@@ -123,3 +123,46 @@ def entity_true_counts(split: Split) -> np.ndarray:
     """|true set| per S1 row, including matches blocking never proposed."""
     return np.fromiter((len(split.truth.get(i, ())) for i in split.s1["id"]), dtype=np.float64,
                        count=len(split.s1))
+
+
+def _count_rows(path: str) -> int:
+    with open(path, "rb") as fh:
+        return max(sum(1 for _ in fh) - 1, 0)
+
+
+def auto_s1_drop(train: Split, test_dir: str, max_frac: float = 0.5) -> float:
+    """Fraction of training Source 1 entities to drop so that training has the test split's
+    records-per-entity ratio.
+
+    The test split has more Source 2/3 records per Source 1 entity than train (5.75 vs 4.68 on the
+    competition data) while the number of true matches per entity is the same: the extra records are
+    distractors, i.e. records of businesses that are not in Source 1. Dropping entities from the
+    training Source 1 turns their records into exactly that kind of distractor, so the model learns
+    the test-time prior and the test-time density of look-alike competitors."""
+    paths = [find_file(test_dir, k) for k in ("s1", "s2", "s3")]
+    if not all(p and os.path.exists(p) for p in paths):
+        return 0.0
+    n1, n23 = _count_rows(paths[0]), _count_rows(paths[1]) + _count_rows(paths[2])
+    if n1 == 0:
+        return 0.0
+    ratio_test = n23 / n1
+    ratio_train = len(train.rec) / max(len(train.s1), 1)
+    frac = 1.0 - ratio_train / ratio_test
+    LOG.info("Records per Source 1 entity: train %.3f, test %.3f -> drop %.1f%% of training Source 1",
+             ratio_train, ratio_test, 100 * max(frac, 0.0))
+    return float(min(max(frac, 0.0), max_frac))
+
+
+def thin_source1(split: Split, frac: float, seed: int) -> Split:
+    """Remove a random `frac` of Source 1 entities; their matched records stay as distractors."""
+    if frac <= 0 or split.truth is None:
+        return split
+    rng = np.random.default_rng(seed + 991)
+    keep = rng.random(len(split.s1)) >= frac
+    s1 = split.s1[keep].reset_index(drop=True)
+    kept = set(s1["id"])
+    truth = {k: v for k, v in split.truth.items() if k in kept}
+    n_dist = sum(len(v) for k, v in split.truth.items() if k not in kept)
+    LOG.info("S1 dropout: kept %d of %d Source 1 entities; %d matched records became distractors",
+             len(s1), len(split.s1), n_dist)
+    return Split(s1, split.rec, truth, split.gt_header)

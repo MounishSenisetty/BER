@@ -139,7 +139,7 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
         return rcols[c][ib]
 
     # ---- blocking provenance / dense cosines ----------------------------------------------
-    for c in BLOCKERS + ["n_blockers", "knn_name_rank", "knn_full_rank", "key_rank", "cheap", "cheap_rank",
+    for c in BLOCKERS + ["n_blockers", "knn_name_rank", "knn_full_rank", "key_rank", "knn_addr_rank", "cheap", "cheap_rank",
                          "cos_name_d", "cos_full_d", "key_score"]:
         F[c] = cand[c].to_numpy()
     F["rec_source"] = rc["source"].to_numpy()[ib].astype(np.int8)

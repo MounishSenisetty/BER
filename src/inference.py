@@ -20,6 +20,8 @@ import pandas as pd
 
 from .features import compute_features
 from .model import Ensemble
+from .cross_encoder import CEConfig, ce_features, score_pairs, torch_device
+from .normalize import set_lexicon
 from .stage2 import RAW, predict_in_batches
 from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
 from .postprocess import select
@@ -41,6 +43,8 @@ def main():
     with open(os.path.join(args.model_dir, "model_bundle.pkl"), "rb") as fh:
         bundle = pickle.load(fh)
     cfg = bundle["config"]
+    set_lexicon(bundle.get("lexicon"))
+    LOG.info("Transliteration lexicon: %d entries", len(bundle.get("lexicon") or {}))
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
     rule = dict(bundle["decision"])
@@ -79,10 +83,23 @@ def main():
     if ens2 is not None:
         raw = {k: np.concatenate(v) for k, v in raw_parts.items()}
         del raw_parts
+        ce = None
+        if bundle.get("ce_models"):
+            ce_cfg = CEConfig(**bundle["ce_config"])
+            if torch_device() != "cuda":
+                LOG.warning("The model uses the cross-encoder but no CUDA GPU is visible: scoring on CPU is very slow")
+            sub = np.flatnonzero(prob >= ce_cfg.min_p)
+            with timer(f"Cross-encoder scoring of {len(sub)} pairs with stage-1 p >= {ce_cfg.min_p}"):
+                logit = score_pairs(bundle["ce_models"], np.full(len(sub), 2, np.int8), split.s1, split.rec,
+                                    ps1[sub].astype(np.int64), prec[sub].astype(np.int64), ce_cfg, cfg.n_jobs)
+                ce = (sub, ce_features(logit, prob[sub], ps1[sub].astype(np.int64), prec[sub].astype(np.int64),
+                                       len(split.s1), len(split.rec)))
+            del logit
         with timer("Stage 2 re-scoring of all pairs"):
             prob = predict_in_batches(ens2, ps1.astype(np.int64), prec.astype(np.int64), prob.astype(np.float32),
-                                      raw, len(split.s1), len(split.rec))
-        del raw
+                                      raw, len(split.s1), len(split.rec), ce=ce,
+                                      features=bundle.get("stage2_features"))
+        del raw, ce
 
     with timer("Writing outputs"):
         write_id_lists(os.path.join(args.out_dir, "candidate_pairs.tsv"), CANDIDATE_HEADER, s1_ids,

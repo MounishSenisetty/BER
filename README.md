@@ -2,13 +2,22 @@
 
 For every Source 1 business, this pipeline finds the matching Source 2 / Source 3 records. It is
 built for the full competition data (~2M Source 1 entities and ~10M Source 2/3 records per split)
-on a Kaggle CPU notebook.
+on a Kaggle notebook (4 CPU cores, ~30 GB RAM; the cross-encoder wants the T4 x2 GPU accelerator).
 
 Stages:
-1. normalise (including Indic-script transliteration);
-2. scalable blocking (FAISS kNN + sparse key index, per country, in record chunks);
-3. LightGBM pair scoring;
-4. a decision layer tuned for macro F0.5.
+1. normalise (Indic-script transliteration plus a transliteration lexicon learned from the training
+   ground truth);
+2. scalable blocking (FAISS kNN on name, name+address and address + sparse key index, per country,
+   in record chunks);
+3. gradient-boosted pair scoring (XGBoost on GPU, LightGBM on CPU);
+4. stage 2: competitor-aware re-scoring, optionally with a character-level transformer
+   cross-encoder as an extra signal (trained from scratch, GPU);
+5. a decision layer tuned for macro F0.5.
+
+Training mimics the test split: the test has ~5.75 Source 2/3 records per Source 1 entity against
+~4.68 in train (same matches per entity, so the extra records are distractors). Training therefore
+drops ~19% of its Source 1 entities, and their records become distractors (`--s1-drop`, sized
+automatically from the test split's row counts).
 
 - Strategy: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Methodology write-up: [`Documentation_template.md`](Documentation_template.md)
@@ -33,9 +42,17 @@ Useful flags:
 - `--train-entities N`: Source 1 entities used for training (default 120k; `0` = all).
 - `--max-candidates K`: candidates kept per record (default 10).
 - `--chunk-records N`: records per chunk; lower it if memory is tight.
-- `--feature-cache PATH`: save the training feature matrix (or load it if it exists), so model and
-  decision experiments skip blocking and features.
-- `--lgb-params JSON`: override LightGBM params, e.g. `'{"num_leaves": 63}'`.
+- `--s1-drop FRAC`: fraction of training Source 1 entities turned into distractors (default: auto from
+  `--test-dir`, which defaults to `../test` next to `--data-dir`; `0` = off).
+- `--cross-encoder auto|on|off`: transformer cross-encoder stacked into stage 2 (`auto` = only when a
+  CUDA GPU is visible). It is kept only if it beats stage 2 without it on nested CV.
+  `--ce-epochs`, `--ce-max-train-pairs` size its training.
+- `--no-lexicon`: skip the learned transliteration lexicon.
+
+Training ends with a **loss report**, which is also saved as `models/loss_report.tsv`. It gives the
+macro-F0.5 points lost to each error type (false positives on distractors vs other owners, scored
+false negatives, blocking misses), tagged by record without address, shared Source 1 name, native
+script and name similarity, with examples.
 
 Error analysis and experiment log:
 - `python scripts/error_analysis.py --data-dir $DATA/train --model-dir models` buckets the worst OOF
@@ -46,7 +63,7 @@ Error analysis and experiment log:
 Try the whole pipeline on generated data:
 
 ```bash
-python scripts/make_synthetic_data.py --out data/dataset
+python scripts/make_synthetic_data.py --out data/dataset --hard   # --hard: real-data noise + test distractors
 python -m src.train --data-dir data/dataset/train --model-dir models --train-entities 0
 python -m src.inference --data-dir data/dataset/test --model-dir models --out-dir output \
        --gt data/dataset/test_labels/test_ground_truth.tsv
@@ -82,4 +99,5 @@ Licences:
 - rapidfuzz: MIT.
 - scikit-learn: BSD.
 
-No pretrained models are used, and no external data or services are called.
+No pretrained models are used (the cross-encoder is trained from scratch on the training split), and no
+external data or services are called. PyTorch (BSD) is used for the cross-encoder.

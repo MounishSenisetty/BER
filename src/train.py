@@ -33,7 +33,11 @@ from .config import PipelineConfig
 from .features import compute_features
 from .model import Ensemble, resolve_backend, train_fold
 from .stage2 import RAW, GroupStats, stage2_frame
-from .pipeline import entity_true_counts, iter_chunks, load_split, owner_array
+from .cross_encoder import CEConfig, assemble, ce_features, config_dict, encode_rows, score_pairs, torch_device, train_model
+from .diagnostics import loss_report
+from .lexicon import learn_from_split
+from .normalize import set_lexicon
+from .pipeline import auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
 
@@ -64,6 +68,42 @@ def entity_folds(n_true_e: np.ndarray, n_folds: int, seed: int) -> np.ndarray:
     return folds
 
 
+def train_cross_encoder(split, ce_cfg, all_s1, all_rec, all_p, n_tr, y, pair_fold, rf, n_jobs):
+    """Train two cross-encoders on disjoint halves of the entity folds (fold % 2) and score every
+    stage-2 pair with p1 >= min_p out of fold. A training pair is scored by the model of the other
+    half; a competitor pair by the model that never saw its record's sampled entity (both models
+    averaged when the record touches both halves, and at test time)."""
+    rng = np.random.default_rng(ce_cfg.seed)
+    grp = (pair_fold % 2).astype(np.int8)
+    p_tr = all_p[:n_tr]
+    pick = (y == 1) | (p_tr >= ce_cfg.train_min_p) | (rng.random(n_tr) < ce_cfg.easy_neg_frac)
+    s1_tr, rec_tr = all_s1[:n_tr], all_rec[:n_tr]
+    u1, t1 = encode_rows(split.s1, s1_tr[pick], ce_cfg, n_jobs)
+    u2, t2 = encode_rows(split.rec, rec_tr[pick], ce_cfg, n_jobs)
+    blobs = []
+    for g in (0, 1):
+        tr = np.flatnonzero(pick & (grp == g))
+        if len(tr) > ce_cfg.max_train_pairs:
+            tr = np.sort(rng.choice(tr, size=ce_cfg.max_train_pairs, replace=False))
+        va = np.flatnonzero(pick & (grp != g) & (p_tr >= ce_cfg.min_p))
+        if len(va) > 200_000:
+            va = np.sort(rng.choice(va, size=200_000, replace=False))
+        Xg = assemble(t1, np.searchsorted(u1, s1_tr[tr]), t2, np.searchsorted(u2, rec_tr[tr]))
+        Xv = assemble(t1, np.searchsorted(u1, s1_tr[va]), t2, np.searchsorted(u2, rec_tr[va]))
+        LOG.info("Cross-encoder %d: %d training pairs (%.1f%% positive)", g, len(tr), 100 * y[tr].mean())
+        blobs.append(train_model(Xg, y[tr], ce_cfg, tag=f"[{g}]", X_val=Xv, y_val=y[va]))
+        del Xg, Xv
+    del t1, t2
+    sub = np.flatnonzero(all_p >= ce_cfg.min_p)
+    use = np.full(len(all_p), 2, dtype=np.int8)
+    use[:n_tr] = 1 - grp
+    rfc = rf[all_rec[n_tr:]]
+    use[n_tr:] = np.where(rfc >= 0, 1 - (rfc % 2), 2)
+    logit = score_pairs(blobs, use[sub], split.s1, split.rec, all_s1[sub], all_rec[sub], ce_cfg, n_jobs)
+    feats = ce_features(logit, all_p[sub], all_s1[sub], all_rec[sub], len(split.s1), len(split.rec))
+    return blobs, (sub, feats)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="data/train")
@@ -77,6 +117,18 @@ def main():
     ap.add_argument("--cache-dir", default="/tmp/ber_stage2_cache",
                     help="scratch space for competitor-pair features (stage 2), ~10 GB on the full data")
     ap.add_argument("--no-stage2", action="store_true")
+    ap.add_argument("--test-dir", default=None,
+                    help="test split directory (default: ../test next to --data-dir); only its row counts are "
+                         "read, to size the S1 dropout")
+    ap.add_argument("--s1-drop", type=float, default=None,
+                    help="fraction of training Source 1 entities to drop so their records become distractors "
+                         "(default: auto from the test split's records-per-entity ratio; 0 = off)")
+    ap.add_argument("--no-lexicon", action="store_true", help="do not learn the transliteration lexicon")
+    ap.add_argument("--cross-encoder", choices=["auto", "on", "off"], default="auto",
+                    help="char-level transformer cross-encoder as a stage-2 feature (auto = only with a CUDA GPU)")
+    ap.add_argument("--ce-epochs", type=float, default=None)
+    ap.add_argument("--ce-max-train-pairs", type=int, default=None)
+    ap.add_argument("--ce-small", action="store_true", help="tiny cross-encoder (CPU smoke tests)")
     args = ap.parse_args()
     setup_logging()
     os.makedirs(args.model_dir, exist_ok=True)
@@ -96,6 +148,16 @@ def main():
     split = load_split(args.data_dir, args.s1, args.s2, args.s3, args.gt, with_truth=True)
     if split.truth is None:
         raise SystemExit("Training needs a ground-truth file (--gt)")
+    lexicon = {}
+    if not args.no_lexicon:
+        with timer("Learning the transliteration lexicon"):
+            lexicon = learn_from_split(split, n_jobs=cfg.n_jobs, seed=cfg.model.seed)
+        set_lexicon(lexicon)
+    s1_drop = args.s1_drop
+    if s1_drop is None:
+        test_dir = args.test_dir or os.path.join(os.path.dirname(os.path.abspath(args.data_dir.rstrip("/"))), "test")
+        s1_drop = auto_s1_drop(split, test_dir) if os.path.isdir(test_dir) else 0.0
+    split = thin_source1(split, s1_drop, cfg.model.seed)
     n_true = entity_true_counts(split)
     owner = owner_array(split)
     in_E = sample_entities(n_true, cfg.model.train_entities, cfg.model.seed)
@@ -113,6 +175,17 @@ def main():
     rec_fmin = np.full(len(split.rec), 127, dtype=np.int8)
     rec_fmax = np.full(len(split.rec), -1, dtype=np.int8)
     use_s2 = not args.no_stage2
+    ce_cfg = CEConfig(seed=cfg.model.seed)
+    if args.ce_epochs:
+        ce_cfg.epochs = args.ce_epochs
+    if args.ce_max_train_pairs:
+        ce_cfg.max_train_pairs = args.ce_max_train_pairs
+    if args.ce_small:
+        ce_cfg.d_model, ce_cfg.n_heads, ce_cfg.n_layers, ce_cfg.ff = 64, 4, 2, 128
+        ce_cfg.name_len, ce_cfg.addr_len, ce_cfg.warmup_steps = 32, 48, 50
+    dev = torch_device()
+    use_ce = use_s2 and (args.cross_encoder == "on" and dev != "none" or args.cross_encoder == "auto" and dev == "cuda")
+    LOG.info("Cross-encoder: %s (torch device: %s)", "on" if use_ce else "off", dev)
     if use_s2:
         shutil.rmtree(args.cache_dir, ignore_errors=True)
         os.makedirs(args.cache_dir, exist_ok=True)
@@ -262,6 +335,8 @@ def main():
     feats_all = list(X.columns)
     ev1 = evaluate(oof, "stage1")
     final, final_prob, s2_models, s2_features, ev2 = ev1, oof, None, None, None
+    variant_scores = {"stage1": ev1["nested"]}
+    s2_uses_ce, ce_blobs = False, None
 
     # ------------------------------------------------------------ stage 2 (competitor-aware re-scoring)
     if use_s2:
@@ -299,31 +374,54 @@ def main():
         LOG.info("Stage 2 universe: %d pairs (%d training pairs + %d competitors)", len(all_p), len(oof), len(all_p) - len(oof))
         rs = GroupStats(all_rec, all_p, len(split.rec))
         ss = GroupStats(all_s1, all_p, len(split.s1))
-        X2 = stage2_frame(all_s1, all_rec, all_p, raw, rs, ss, slice(0, len(oof)))
-        del all_s1, all_rec, all_p, raw, rs, ss, c_s1, c_rec, c_p, c_raw
-        s2_features = list(X2.columns)
+        n_tr = len(oof)
+        ce_pack, ce_blobs = None, None
+        if use_ce:
+            with timer("Cross-encoder (2 models on disjoint fold halves, out-of-fold scores)"):
+                ce_blobs, ce_pack = train_cross_encoder(split, ce_cfg, all_s1, all_rec, all_p, n_tr, y, pair_fold, rf,
+                                                        cfg.n_jobs)
         cfg2 = copy.deepcopy(cfg.model)
         cfg2.num_boost_round, cfg2.early_stopping_rounds = 1500, 50
         cfg2.params = dict(cfg2.params, num_leaves=63, learning_rate=0.05)
-        oof2 = np.zeros(len(y))
-        s2_models = []
-        for f in range(cfg.model.n_folds):
-            tr, va = pair_fold != f, pair_fold == f
-            with timer(f"Stage 2 fold {f}"):
-                m, oof2[va], _ = train_fold(backend, cfg2, X2[tr], y[tr], X2[va], y[va])
-                LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof2[va], labels=[0, 1]))
-            s2_models.append(m)
-        LOG.info("Stage 2 OOF logloss %.5f (stage 1: %.5f)", log_loss(y, oof2, labels=[0, 1]), oof_ll)
-        ev2 = evaluate(oof2, "stage2")
-        if ev2["nested"] > ev1["nested"]:
-            final, final_prob = ev2, oof2
-        else:
+        variants = [("stage2", None)] + ([("stage2+ce", ce_pack)] if ce_pack is not None else [])
+        for tag, ce in variants:
+            X2 = stage2_frame(all_s1, all_rec, all_p, raw, rs, ss, slice(0, n_tr), ce=ce)
+            oof2 = np.zeros(len(y))
+            models2 = []
+            for f in range(cfg.model.n_folds):
+                tr, va = pair_fold != f, pair_fold == f
+                with timer(f"{tag} fold {f}"):
+                    m, oof2[va], imp2 = train_fold(backend, cfg2, X2[tr], y[tr], X2[va], y[va])
+                    LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof2[va], labels=[0, 1]))
+                models2.append(m)
+            LOG.info("[%s] OOF logloss %.5f (stage 1: %.5f)", tag, log_loss(y, oof2, labels=[0, 1]), oof_ll)
+            if ce is not None:
+                LOG.info("[%s] top features:\n%s", tag, imp2.sort_values("gain", ascending=False).head(12).to_string(index=False))
+            ev = evaluate(oof2, tag)
+            variant_scores[tag] = ev["nested"]
+            if ev["nested"] > final["nested"]:
+                final, final_prob = ev, oof2
+                s2_models, s2_features = models2, list(X2.columns)
+                s2_uses_ce = ce is not None
+            if ev2 is None or ev["nested"] > ev2["nested"]:
+                ev2 = ev
+            del X2
+        del all_s1, all_rec, all_p, raw, rs, ss, c_s1, c_rec, c_p, c_raw
+        if s2_models is None:
             LOG.info("Stage 2 did not beat stage 1 on nested CV -> keeping stage 1")
-            s2_models, s2_features = None, None
+        if not s2_uses_ce:
+            ce_blobs = None
     best, sel, tuned, nested_score, nested = (final["best"], final["sel"], final["tuned"], final["nested"],
                                               final["nested_per_fold"])
     final["curve"].to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
-    LOG.info("FINAL (%s): nested-CV macro F0.5 %.5f", "stage2" if s2_models else "stage1", nested_score)
+    try:
+        loss_report(split, owner, E_rows, n_true_E, ent, ps1, prec, y.astype(bool), sel.astype(bool), final_prob,
+                    found[E_rows], args.model_dir)
+    except Exception as ex:          # diagnostics must never cost a finished training run
+        LOG.warning("loss report failed: %r", ex)
+    final_tag = ("stage2+ce" if s2_uses_ce else "stage2") if s2_models else "stage1"
+    LOG.info("Nested-CV macro F0.5 by variant: %s", {k: round(v, 5) for k, v in variant_scores.items()})
+    LOG.info("FINAL (%s): nested-CV macro F0.5 %.5f", final_tag, nested_score)
 
     pd.DataFrame({"source1_entity_id": split.s1["id"].to_numpy()[ps1], "candidate_entity_id": split.rec["id"].to_numpy()[prec],
                   "label": y.astype(int), "oof_prob": oof, "final_prob": final_prob, "fold": pair_fold,
@@ -334,11 +432,13 @@ def main():
               "best_iterations": best_iters, "backend": backend, "n_features": len(feats_all),
               "train_pairs": int(len(y)), "train_entities": int(in_E.sum()),
               "stage1_nested_cv_macro_f05": ev1["nested"],
-              "stage2_nested_cv_macro_f05": ev2["nested"] if ev2 else None, "uses_stage2": s2_models is not None}
+              "stage2_nested_cv_macro_f05": ev2["nested"] if ev2 else None, "uses_stage2": s2_models is not None,
+              "s1_drop": s1_drop, "lexicon_size": len(lexicon), "variants": variant_scores, "final": final_tag}
     with open(os.path.join(args.model_dir, "cv_report.json"), "w") as fh:
         json.dump(report, fh, indent=2, default=float)
     bundle = {"models": models, "features": feats_all, "decision": best, "config": cfg,
-              "stage2_models": s2_models, "stage2_features": s2_features}
+              "stage2_models": s2_models, "stage2_features": s2_features, "lexicon": lexicon,
+              "ce_models": ce_blobs, "ce_config": config_dict(ce_cfg) if ce_blobs else None}
     with open(os.path.join(args.model_dir, "model_bundle.pkl"), "wb") as fh:
         pickle.dump(bundle, fh)
     LOG.info("Saved model bundle to %s", os.path.join(args.model_dir, "model_bundle.pkl"))

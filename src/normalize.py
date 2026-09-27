@@ -356,11 +356,34 @@ _RE_ALPHA_DIGIT = re.compile(r"(?<=[^\W\d_]{3})(?=\d)|(?<=\d)(?=[^\W\d_]{3})", r
 _RE_NUM = re.compile(r"^\d+[a-z]?$")
 
 
+# native-script word -> Latin form, learned from the training ground truth (src/lexicon.py);
+# set once per process (train / inference and every normalisation worker) before prepare()
+_LEXICON: Dict[str, str] = {}
+_RE_INDIC_WORD = re.compile("[\u0900-\u0DFF\u200b-\u200d]+")
+
+
+def set_lexicon(lex) -> None:
+    global _LEXICON
+    _LEXICON = dict(lex or {})
+
+
+def get_lexicon() -> Dict[str, str]:
+    return _LEXICON
+
+
+def _lex_sub(m) -> str:
+    from .lexicon import native_key
+    v = _LEXICON.get(native_key(m.group(0)))
+    return f" {v} " if v else m.group(0)
+
+
 def clean(s: str) -> str:
     """Script/format normalisation shared by names and addresses. Returns lowercase ASCII-ish text."""
     if not isinstance(s, str) or not s:
         return ""
     if _RE_INDIC.search(s):
+        if _LEXICON:
+            s = _RE_INDIC_WORD.sub(_lex_sub, s)
         s = _translit_runs(s)
     s = _RE_URL.sub(r"\1", s)
     s = _RE_DOTTED.sub(lambda m: m.group(0).replace(".", ""), s)
@@ -579,7 +602,8 @@ def prepare(df: pd.DataFrame, n_jobs: int = -1, block: int = 50_000) -> pd.DataF
     jobs = [(names[i:i + block], addrs[i:i + block], ctry[i:i + block]) for i in range(0, len(out), block)]
     n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs)), initializer=set_lexicon,
+                                 initargs=(_LEXICON,)) as ex:
             parts = list(ex.map(_prep_block, jobs))
     else:
         parts = [_prep_block(j) for j in jobs]

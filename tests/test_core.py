@@ -180,3 +180,45 @@ def test_house_number_is_anchored_on_the_street_type():
     assert (r[C["house"]], r[C["street"]], r[C["unit"]]) == ("500", "5th", "200")
     r = _prep_one("x", "H.No 962, Gulmohar Colony, Mumbai, Maharashtra 400502", "India")
     assert (r[C["house"]], r[C["postal"]]) == ("962", "400502")
+
+
+def test_lexicon_alignment_and_application():
+    from src.lexicon import _align, learn_lexicon
+    from src.normalize import _prep_one, set_lexicon
+    nat = ["গোল্ড", "সফটওয়্যার", "প্রাইভেট", "লিমিটেড"]
+    pairs = [" ".join(nat), "গোল্ড সফটওয়্যার", "সফটওয়্যার প্রাইভেট লিমিটেড"]
+    lat = ["Gold Software Private Limited", "Gold Software Pvt Ltd", "Software Private Limited"]
+    lex = learn_lexicon(pairs * 3, lat * 3, np.repeat(np.arange(9), 1), min_entities=3, n_jobs=1)
+    assert lex.get("সফটওয়্যার") == "software" and lex.get("লিমিটেড") == "limited"
+    try:
+        set_lexicon(lex)
+        assert _prep_one("গোল্ড সফটওয়্যার প্রাইভেট লিমিটেড", "", "India")[1] == "gold softvare"   # India phonetic w -> v, as for Latin "software"
+    finally:
+        set_lexicon({})
+    # 1:2 alignment of one native token to two Latin tokens
+    out = _align(["pashchimbanga"], ["pashchimbanga"], ["west", "bengal", "pashchim", "banga"],
+                 ["vest", "bengal", "pashchim", "banga"], 0.45)
+    assert out == [("pashchimbanga", "pashchim banga")]
+
+
+def test_thin_source1_turns_records_into_distractors():
+    from src.pipeline import Split, owner_array, thin_source1
+    s1 = pd.DataFrame({"id": [f"a{i}" for i in range(100)], "name": "x", "address": "", "country": "US", "source": 1})
+    rec = pd.DataFrame({"id": [f"r{i}" for i in range(100)], "name": "x", "address": "", "country": "US", "source": 2})
+    truth = {f"a{i}": {f"r{i}"} for i in range(100)}
+    sp = thin_source1(Split(s1, rec, truth, ("a", "b")), 0.3, 0)
+    assert 50 < len(sp.s1) < 90 and set(sp.truth) == set(sp.s1["id"])
+    own = owner_array(sp)
+    assert (own >= 0).sum() == len(sp.s1) and len(sp.rec) == 100
+
+
+def test_stage2_frame_scatters_cross_encoder_features():
+    from src.stage2 import RAW, GroupStats, stage2_frame
+    n = 6
+    s1, rec = np.array([0, 0, 1, 1, 2, 2]), np.arange(n)
+    p1 = np.linspace(0.1, 0.9, n).astype(np.float32)
+    raw = {k: np.zeros(n, np.float16) for k in RAW}
+    rs, ss = GroupStats(rec, p1, n), GroupStats(s1, p1, 3)
+    sub = np.array([1, 4, 5])
+    F = stage2_frame(s1, rec, p1, raw, rs, ss, slice(2, 6), ce=(sub, {"ce_logit": np.array([7., 8., 9.], np.float32)}))
+    assert np.isnan(F["ce_logit"].iloc[0]) and F["ce_logit"].tolist()[2:] == [8.0, 9.0]

@@ -64,22 +64,35 @@ def _side(prefix: str, st: GroupStats, g: np.ndarray, p: np.ndarray, sel: slice)
 
 
 def stage2_frame(s1: np.ndarray, rec: np.ndarray, p1: np.ndarray, raw: Dict[str, np.ndarray],
-                 rec_stats: GroupStats, s1_stats: GroupStats, sel=slice(None)) -> pd.DataFrame:
+                 rec_stats: GroupStats, s1_stats: GroupStats, sel=slice(None), ce=None) -> pd.DataFrame:
+    """`sel` must be a contiguous slice. `ce` = (sorted indices of the cross-encoder-scored pairs,
+    {feature: values for those pairs}); every other pair gets NaN in those columns."""
     p = p1[sel].astype(np.float32)
     F = {"p1": p, "p1_logit": np.log(np.clip(p, 1e-6, 1 - 1e-6) / np.clip(1 - p, 1e-6, 1))}
     F.update(_side("rec", rec_stats, rec, p1, sel))
     F.update(_side("ent", s1_stats, s1, p1, sel))
     for k in RAW:
         F[k] = np.asarray(raw[k][sel], dtype=np.float32)
+    if ce is not None:
+        sub, feats = ce
+        a, b, _ = sel.indices(len(p1))
+        lo, hi = np.searchsorted(sub, a), np.searchsorted(sub, b)
+        at = sub[lo:hi] - a
+        for k, v in feats.items():
+            col = np.full(b - a, np.nan, dtype=np.float32)
+            col[at] = v[lo:hi]
+            F[k] = col
     return pd.DataFrame(F)
 
 
-def predict_in_batches(ens, s1, rec, p1, raw, n_s1: int, n_rec: int, batch: int = 5_000_000) -> np.ndarray:
+def predict_in_batches(ens, s1, rec, p1, raw, n_s1: int, n_rec: int, batch: int = 5_000_000,
+                       ce=None, features=None) -> np.ndarray:
     """Stage-2 probabilities for every pair, assembling features batch by batch to bound memory."""
     rs = GroupStats(rec, p1, n_rec)
     ss = GroupStats(s1, p1, n_s1)
     out = np.empty(len(p1), dtype=np.float64)
     for a in range(0, len(p1), batch):
         sl = slice(a, min(a + batch, len(p1)))
-        out[sl] = ens.predict(stage2_frame(s1, rec, p1, raw, rs, ss, sl))
+        F = stage2_frame(s1, rec, p1, raw, rs, ss, sl, ce=ce)
+        out[sl] = ens.predict(F[features] if features else F)
     return out
