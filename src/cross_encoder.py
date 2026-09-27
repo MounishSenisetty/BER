@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .utils import LOG
+from .utils import cpu_limit, LOG
 
 PAD, CLS, UNK = 0, 1, 2
 _CHARS = " abcdefghijklmnopqrstuvwxyz0123456789"
@@ -100,7 +100,7 @@ def encode_texts(texts: Sequence[str], width: int, n_jobs: int = -1, block: int 
     texts = [t if isinstance(t, str) else "" for t in texts]
     lex = get_lexicon()
     jobs = [(texts[i:i + block], width, lex) for i in range(0, len(texts), block)]
-    n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
             parts = list(ex.map(_encode_block, jobs))
@@ -122,7 +122,7 @@ def clean_texts(texts: Sequence[str], n_jobs: int = -1, block: int = 100_000) ->
     from .normalize import get_lexicon
     texts = [t if isinstance(t, str) else "" for t in texts]
     jobs = [(texts[i:i + block], get_lexicon()) for i in range(0, len(texts), block)]
-    n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
             parts = list(ex.map(_clean_block, jobs))

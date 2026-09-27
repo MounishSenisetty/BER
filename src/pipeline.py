@@ -177,3 +177,61 @@ def restrict_countries(split: Split, countries) -> Split:
     truth = {k: v for k, v in split.truth.items() if k in kept} if split.truth is not None else None
     LOG.info("Countries %s: %d Source 1 rows, %d records", sorted(countries), len(s1), int(k2.sum()))
     return Split(s1, split.rec[k2].reset_index(drop=True), truth, split.gt_header)
+
+
+_RE_PARTS = None
+
+
+def state_of(addr: str, country: str) -> str:
+    """Country + state key of an address ('' when no state/region is recognisable)."""
+    import re
+    from .normalize import FR_REGIONS, IN_STATES, US_STATES
+    global _RE_PARTS
+    if _RE_PARTS is None:
+        _RE_PARTS = re.compile(r"[^a-z ]+")
+    ck = country_key(country)
+    table = {"us": US_STATES, "india": IN_STATES, "france": FR_REGIONS}.get(ck)
+    if table is None:
+        return ""
+    codes = set(table.values())
+    for p in reversed(str(addr).lower().split(",")):
+        p = " ".join(_RE_PARTS.sub(" ", p).split())
+        for cand in (p, p.split(" ")[-1] if p else ""):
+            if cand in table:
+                return ck + ":" + table[cand]
+            if cand in codes and (ck != "india" or len(cand) > 2):
+                return ck + ":" + cand
+    return ""
+
+
+def subset_by_state(split: Split, frac: float, seed: int) -> Split:
+    """Keep a random `frac` of whole states: their Source 1 entities, the records located there, and
+    records without a recognisable state when their owner is kept (unmatched ones at rate `frac`).
+    Look-alike density inside a state is unchanged, so the training task stays as hard as the full
+    one, at a fraction of the blocking / feature cost."""
+    import hashlib
+    if frac >= 1 or split.truth is None:
+        return split
+    st1 = np.array([state_of(a, c) for a, c in zip(split.s1["address"], split.s1["country"])], dtype=object)
+
+    def keep_state(st):
+        return st != "" and int(hashlib.md5(f"{seed}:{st}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF < frac
+
+    kept_states = {st for st in set(st1) if keep_state(st)}
+    k1 = np.array([st in kept_states for st in st1]) | (st1 == "")          # stateless S1 rows: keep
+    s1 = split.s1[k1].reset_index(drop=True)
+    kept_ids = set(s1["id"])
+    owner = {m: s for s, ms in split.truth.items() for m in ms}
+    own = split.rec["id"].map(owner)
+    st = np.array([state_of(a, c) for a, c in zip(split.rec["address"], split.rec["country"])], dtype=object)
+    rng = np.random.default_rng(seed)
+    known = st != ""
+    keep = np.where(known, np.array([x in kept_states for x in st]),
+                    np.where(own.notna(), own.isin(kept_ids), rng.random(len(st)) < frac))
+    keep &= ~(own.notna() & ~own.isin(kept_ids)).to_numpy()   # never turn a dropped entity's record into a distractor
+    rec = split.rec[keep].reset_index(drop=True)
+    kept_rec = set(rec["id"])
+    truth = {k: {m for m in v if m in kept_rec} for k, v in split.truth.items() if k in kept_ids}
+    LOG.info("State subset (%.0f%%): %d of %d states, %d / %d Source 1 rows, %d / %d records", 100 * frac,
+             len(kept_states), len(set(st1) - {""}), len(s1), len(split.s1), len(rec), len(split.rec))
+    return Split(s1, rec, truth, split.gt_header)

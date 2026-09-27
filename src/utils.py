@@ -16,6 +16,16 @@ BETA2 = 0.25  # beta = 0.5  ->  beta^2 = 0.25
 LOG = logging.getLogger("ber")
 
 
+def cpu_limit() -> int:
+    """CPU cores to use: all of them, capped by BER_MAX_THREADS (default 32). Kaggle TPU VMs have far
+    more cores than the pipeline can use, and one worker / thread per core only adds overhead."""
+    try:
+        cap = int(os.environ.get("BER_MAX_THREADS", "32"))
+    except ValueError:
+        cap = 32
+    return max(1, min(os.cpu_count() or 1, cap))
+
+
 def setup_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s",
                         datefmt="%H:%M:%S")

@@ -29,7 +29,7 @@ from sklearn.feature_extraction import FeatureHasher
 from sklearn.feature_extraction.text import HashingVectorizer
 
 from .config import BlockingConfig
-from .utils import LOG
+from .utils import cpu_limit, LOG
 
 try:
     import faiss
@@ -80,7 +80,7 @@ def _l2_normalize_rows(X: sp.csr_matrix) -> sp.csr_matrix:
 
 def _n_jobs(n: int) -> int:
     import os
-    return (os.cpu_count() or 1) if n is None or n < 1 else n
+    return cpu_limit() if n is None or n < 1 else n
 
 
 # ----------------------------------------------------------------------------------------------

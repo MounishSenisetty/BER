@@ -28,6 +28,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 from rapidfuzz.distance import OSA
+from .utils import cpu_limit
 
 try:
     import jellyfish
@@ -619,8 +620,9 @@ def prepare(df: pd.DataFrame, n_jobs: int = -1, block: int = 50_000) -> pd.DataF
     names = out["name"].tolist()
     addrs = out["address"].tolist()
     ctry = out["country"].tolist() if "country" in out.columns else [""] * len(out)
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
+    block = max(5_000, min(block, -(-len(out) // n_jobs)))       # at least one block per worker
     jobs = [(names[i:i + block], addrs[i:i + block], ctry[i:i + block]) for i in range(0, len(out), block)]
-    n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs)), initializer=set_lexicon,
                                  initargs=(_LEXICON,)) as ex:

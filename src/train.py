@@ -37,7 +37,7 @@ from .cross_encoder import CEConfig, assemble, ce_features, config_dict, encode_
 from .diagnostics import loss_report
 from .lexicon import learn_from_split
 from .normalize import set_lexicon
-from .pipeline import restrict_countries, auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
+from .pipeline import subset_by_state, restrict_countries, auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
 
@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
+    ap.add_argument("--n-jobs", type=int, default=None,
+                    help="max CPU workers / threads (default: all cores, capped at 32; env BER_MAX_THREADS)")
     ap.add_argument("--backend", choices=["auto", "xgboost", "lightgbm"], default=None)
     ap.add_argument("--cache-dir", default="/tmp/ber_stage2_cache",
                     help="scratch space for competitor-pair features (stage 2), ~10 GB on the full data")
@@ -125,6 +127,9 @@ def main():
                          "(default: auto from the test split's records-per-entity ratio; 0 = off)")
     ap.add_argument("--no-lexicon", action="store_true", help="do not learn the transliteration lexicon")
     ap.add_argument("--countries", default=None, help="comma-separated country labels to train on (quick experiments)")
+    ap.add_argument("--train-state-frac", type=float, default=1.0,
+                    help="train on a random fraction of whole states (e.g. 0.5 halves training time; look-alike "
+                         "density within a state is unchanged)")
     ap.add_argument("--cross-encoder", choices=["auto", "on", "off"], default="auto",
                     help="char-level transformer cross-encoder as a stage-2 feature (auto = only with a CUDA GPU)")
     ap.add_argument("--ce-epochs", type=float, default=None)
@@ -148,6 +153,8 @@ def main():
         cfg.model.train_entities = args.train_entities
     if args.max_candidates:
         cfg.blocking.max_candidates_per_record = args.max_candidates
+    if args.n_jobs:
+        os.environ["BER_MAX_THREADS"] = str(args.n_jobs)
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
     if args.backend:
@@ -164,6 +171,8 @@ def main():
         with timer("Learning the transliteration lexicon"):
             lexicon = learn_from_split(split, n_jobs=cfg.n_jobs, seed=cfg.model.seed)
         set_lexicon(lexicon)
+    if args.train_state_frac < 1:
+        split = subset_by_state(split, args.train_state_frac, cfg.model.seed)
     s1_drop = args.s1_drop
     if s1_drop is None:
         test_dir = args.test_dir or os.path.join(os.path.dirname(os.path.abspath(args.data_dir.rstrip("/"))), "test")
