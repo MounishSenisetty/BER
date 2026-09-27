@@ -22,8 +22,7 @@ automatically from the test split's row counts).
 - Strategy: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Methodology write-up: [`Documentation_template.md`](Documentation_template.md)
 
-**Kaggle (GPU):** [`notebooks/kaggle_gpu.ipynb`](notebooks/kaggle_gpu.ipynb). Its cells clone this
-branch, install the extra packages, locate the dataset, train, run inference, validate and package the
+**Kaggle (GPU):** [`notebooks/kaggle_gpu.ipynb`](notebooks/kaggle_gpu.ipynb). Its cells clone `main`, install the extra packages, locate the dataset, train, run inference, validate and package the
 submission.
 
 **How high can the score go?** On the training split, 39.6 % of Source 1 names are shared by more
