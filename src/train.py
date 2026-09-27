@@ -31,7 +31,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 
 from .config import PipelineConfig
 from .features import compute_features
-from .model import Ensemble, resolve_backend, train_fold
+from .model import Ensemble, resolve_backend, train_fold, train_fold_idx
 from .stage2 import RAW, GroupStats, stage2_frame
 from .cross_encoder import CEConfig, assemble, ce_features, config_dict, encode_rows, score_pairs, torch_device, train_model
 from .diagnostics import loss_report
@@ -249,7 +249,8 @@ def main():
         with timer(f"  features for {len(cand)} pairs"):
             X = compute_features(ch.idx, ch.rc, cand, ch.mats, n_jobs=cfg.n_jobs)
         keep = e[sub]
-        Xs.append(X[keep].reset_index(drop=True))
+        feat_names = list(X.columns)
+        Xs.append(X.to_numpy(np.float32)[keep])        # plain float32 rows: no pandas overhead / copies
         ys.append(y[sub][keep])
         s1s.append(gs1[sub][keep])
         recs.append(grec[sub][keep])
@@ -285,12 +286,24 @@ def main():
         md.to_csv(os.path.join(args.model_dir, "blocking_misses.tsv"), sep="\t", index=False)
         LOG.info("Sampled blocking misses -> blocking_misses.tsv: %s", md["reason"].value_counts().to_dict())
 
-    X = pd.concat(Xs, ignore_index=True)
+    # the last chunk still holds a whole country index (several GB): release it before the model stage
+    del ch
+    import gc
+    gc.collect()
+    # one float32 matrix, filled chunk by chunk (never two full copies in memory)
+    X = np.empty((sum(len(a) for a in Xs), len(feat_names)), dtype=np.float32)
+    at = 0
+    while Xs:
+        part = Xs.pop(0)
+        X[at:at + len(part)] = part
+        at += len(part)
+        del part
+    gc.collect()
     y = np.concatenate(ys)
     ps1 = np.concatenate(s1s)
     prec = np.concatenate(recs)
-    del Xs
-    LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d", len(y), y.sum(), 100 * y.mean(), X.shape[1])
+    LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d (%.1f GB) | memory: %s", len(y), y.sum(),
+             100 * y.mean(), X.shape[1], X.nbytes / 1e9, peak_memory_gb())
 
     # ------------------------------------------------------------ entity-grouped CV
     ent = e_local[ps1]
@@ -300,9 +313,9 @@ def main():
     models, imps, best_iters = [], [], []
     backend = resolve_backend(cfg.model.backend)
     for f in range(cfg.model.n_folds):
-        tr, va = pair_fold != f, pair_fold == f
-        with timer(f"Fold {f}: train {tr.sum()} / valid {va.sum()} pairs"):
-            m, oof[va], imp_f = train_fold(backend, cfg.model, X[tr], y[tr], X[va], y[va])
+        tr, va = np.flatnonzero(pair_fold != f), np.flatnonzero(pair_fold == f)
+        with timer(f"Fold {f}: train {len(tr)} / valid {len(va)} pairs"):
+            m, oof[va], imp_f = train_fold_idx(backend, cfg.model, X, y, tr, va, feat_names)
             LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof[va], labels=[0, 1]))
         models.append(m)
         best_iters.append(int(m[2]))
@@ -350,7 +363,7 @@ def main():
         return {"best": best, "curve": curve, "sel": sel, "tuned": tuned, "nested": nested_score,
                 "nested_per_fold": nested}
 
-    feats_all = list(X.columns)
+    feats_all = list(feat_names)
     ev1 = evaluate(oof, "stage1")
     final, final_prob, s2_models, s2_features, ev2 = ev1, oof, None, None, None
     variant_scores = {"stage1": ev1["nested"]}
@@ -360,9 +373,8 @@ def main():
     # ------------------------------------------------------------ stage 2 (competitor-aware re-scoring)
     if use_s2:
         import gc
-        feats = list(X.columns)
-        raw_E = {k: X[k].to_numpy(np.float16) for k in RAW}      # float16, exactly as stored at inference
-        n_features = X.shape[1]
+        feats = list(feat_names)
+        raw_E = {k: X[:, feats.index(k)].astype(np.float16) for k in RAW}   # float16, as stored at inference
         del X
         gc.collect()
         ens_all = Ensemble(models)
