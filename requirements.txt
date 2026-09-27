@@ -7,3 +7,5 @@ rapidfuzz>=3.6
 faiss-cpu>=1.7.4
 joblib>=1.2
 jellyfish>=1.0
+xgboost>=2.0
+torch>=2.1                # optional: cross-encoder (preinstalled on Kaggle GPU images)

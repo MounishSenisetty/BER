@@ -73,9 +73,62 @@ FR_STREETS = [("Rue", "R."), ("Boulevard", "Bd"), ("Avenue", "Av."), ("Place", "
 FR_NAMES = ["de Dieppe", "Pierre Dignac", "du President Roosevelt", "Jean Jaures", "Victor Hugo", "de la Paix"]
 
 
+# --hard mode: English words written phonetically in an Indic script ("Software" -> সফটওয়্যার),
+# the way the real data renders Indian business names; the rule transliterator cannot undo this
+_SCRIPTS = [0x0900, 0x0980, 0x0C80, 0x0C00, 0x0D00]         # Devanagari, Bengali, Kannada, Telugu, Malayalam
+_C_OFF = {"kh": 0x16, "gh": 0x18, "ch": 0x1A, "th": 0x25, "dh": 0x27, "ph": 0x2B, "bh": 0x2D, "sh": 0x36,
+          "k": 0x15, "g": 0x17, "j": 0x1C, "t": 0x1F, "d": 0x21, "n": 0x28, "p": 0x2A, "b": 0x2C, "m": 0x2E,
+          "y": 0x2F, "r": 0x30, "l": 0x32, "v": 0x35, "s": 0x38, "h": 0x39}
+_V_IND = {"aa": 0x06, "ii": 0x08, "uu": 0x0A, "ai": 0x10, "au": 0x14, "a": 0x05, "i": 0x07, "u": 0x09,
+          "e": 0x0F, "o": 0x13}
+_V_MAT = {"aa": 0x3E, "ii": 0x40, "uu": 0x42, "ai": 0x48, "au": 0x4C, "i": 0x3F, "u": 0x41, "e": 0x47, "o": 0x4B}
+
+
+def _respell(w: str) -> str:
+    """Crude English -> Indian phonetic spelling (software -> saftaveyar, service -> sarvis)."""
+    w = w.lower()
+    for a, b in (("ware", "veyar"), ("tion", "shan"), ("ck", "k"), ("ph", "f"), ("qu", "kv"), ("x", "ks"),
+                 ("ee", "ii"), ("oo", "u"), ("ou", "au"), ("w", "v"), ("q", "k"), ("z", "j"), ("f", "ph")):
+        w = w.replace(a, b)
+    w = "".join("s" if c == "c" and w[i + 1:i + 2] in ("e", "i", "y") else ("k" if c == "c" else c)
+                for i, c in enumerate(w))
+    if w.endswith("er"):
+        w = w[:-2] + "ar"
+    if len(w) > 3 and w.endswith("e") and w[-2] not in "aeiou":
+        w = w[:-1]
+    return w.replace("y", "i") if not w.startswith("y") else w
+
+
+def to_script(word: str, block: int) -> str:
+    w = _respell(word)
+    out, i, prev_cons = [], 0, False
+    while i < len(w):
+        v = next((x for x in ("aa", "ii", "uu", "ai", "au", "a", "i", "u", "e", "o") if w.startswith(x, i)), None)
+        if v:
+            if prev_cons:
+                if v != "a":
+                    out.append(chr(block + _V_MAT[v]))
+            else:
+                out.append(chr(block + _V_IND[v]))
+            prev_cons = False
+            i += len(v)
+            continue
+        c = next((x for x in _C_OFF if w.startswith(x, i)), None)
+        if c is None:
+            i += 1
+            continue
+        if prev_cons:
+            out.append(chr(block + 0x4D))               # virama: conjunct
+        out.append(chr(block + _C_OFF[c]))
+        prev_cons = True
+        i += len(c)
+    return "".join(out)
+
+
 class Gen:
-    def __init__(self, seed):
+    def __init__(self, seed, hard=False):
         self.r = random.Random(seed)
+        self.hard = hard
 
     def typo(self, s):
         r = self.r
@@ -120,6 +173,33 @@ class Gen:
         return {"name": (base + " " + legal).strip(), "base": base, "legal": legal, "addr": addr,
                 "country": country, "chain": False}
 
+    def hard_name(self, name, e):
+        """Real-data name noise: domains / handles, dropped or appended words, word swaps,
+        several typos, phone numbers."""
+        r = self.r
+        u = r.random()
+        words = name.split()
+        if u < 0.04:
+            return "".join(w.lower() for w in e["base"].split()) + ".com"
+        if u < 0.05:
+            return "@" + words[0].lower() + str(r.randint(1, 99))
+        if u < 0.10:
+            return name + " " + r.choice(["Services", "Service", "Center", "Group", "Partners", "Co"])
+        if u < 0.15 and len(words) > 2:
+            del words[r.randrange(len(words))]
+            return " ".join(words)
+        if u < 0.19 and len(words) > 1:
+            i = r.randrange(len(words) - 1)
+            words[i], words[i + 1] = words[i + 1], words[i]
+            return " ".join(words)
+        if u < 0.24:
+            for _ in range(r.choice([2, 3])):
+                name = self.typo(name)
+            return name
+        if u < 0.26:
+            return name + " - " + str(r.randint(6 * 10**9, 10**10 - 1))
+        return name
+
     @staticmethod
     def addr_str(a, order=0):
         line = " ".join(x for x in [a["num"], a["street"]] if x)
@@ -146,14 +226,26 @@ class Gen:
             elif legal == "Inc" and r.random() < 0.3:
                 legal = "Inc."
             name = f"{base} {legal}".strip()
-        if r.random() < 0.25:
+        u = r.random()
+        if u < 0.07:                                  # unrelated trade / brand name (only the address links it)
+            syl = ["zeta", "lyra", "novi", "quo", "zeph", "xylo", "lum", "kelo", "riza", "halo", "pyra", "avi", "ecto"]
+            name = "".join(r.sample(syl, r.choice([2, 3]))).capitalize()
+        elif u < 0.11:                                # acronym of the core name ("WEC", "MC")
+            name = "".join(w[0] for w in base.split()).upper()
+        elif u < 0.36:
             name = self.typo(name)
         if e["chain"] and r.random() < 0.4:
             name += f" #{r.randint(1, 2999):04d}"
         if r.random() < 0.05:
             name = r.choice(["-- ", "<< ", "** "]) + name
+        if self.hard:
+            name = self.hard_name(name, e)
         if e["country"] == "India" and r.random() < 0.3:
-            name = " ".join(DEVA.get(w, w) for w in name.replace(".", "").split())
+            if self.hard and r.random() < 0.6:
+                blk = r.choice(_SCRIPTS)
+                name = " ".join(to_script(w, blk) for w in name.replace(".", "").split())
+            else:
+                name = " ".join(DEVA.get(w, w) for w in name.replace(".", "").split())
         u = r.random()
         if u < 0.3:
             name = name.upper()
@@ -161,8 +253,16 @@ class Gen:
             name = name.lower()
 
         a = dict(e["addr"])
-        if r.random() < (0.03 if vendor == 2 else 0.04):
+        if r.random() < ((0.03 if vendor == 2 else 0.04) * (3 if self.hard else 1)):
             return name, ""
+        if self.hard and r.random() < 0.15:          # house number mistyped / replaced
+            n = a["num"]
+            d = [i for i, ch in enumerate(n) if ch.isdigit()]
+            if d and r.random() < 0.6:
+                i = r.choice(d)
+                a["num"] = n[:i] + str(r.randint(0, 9)) + n[i + 1:]
+            else:
+                a["num"] = str(r.randint(1, 9999))
         if e["country"] == "US":
             st = a["street"]
             for full, ab in US_TYPES:
@@ -192,25 +292,35 @@ class Gen:
         return (s.upper() if r.random() < 0.3 else s, name)[::-1]
 
 
-def make_split(g: Gen, n_s1: int, countries):
+def make_split(g: Gen, n_s1: int, countries, keep_frac: float = 1.0):
+    """keep_frac < 1 (--hard): generate n_s1 / keep_frac entities with records, keep n_s1 of them in
+    Source 1; the records of the others become distractors (how the real splits look)."""
     r = g.r
     ents = []
-    for _ in range(n_s1):
+    n_univ = int(round(n_s1 / keep_frac))
+    for _ in range(n_univ):
         c = r.choices(countries, weights=[0.55, 0.35, 0.10][:len(countries)])[0]
         e = g.entity(c)
         if c == "US" and r.random() < 0.08:
             e["base"], e["legal"], e["chain"] = r.choice(CHAINS), "", True
             e["name"] = e["base"]
         ents.append(e)
-    s1_ids = [f"S1-{i}" for i in r.sample(range(10**8, 10**9), n_s1)]
+    all_ids = [f"S1-{i}" for i in r.sample(range(10**8, 10**9), n_univ)]
+    s1_ids = all_ids[:n_s1]
     recs, gt = [], {i: [] for i in s1_ids}
-    for sid, e in zip(s1_ids, ents):
-        if r.random() < 0.3:
+    for k, (sid, e) in enumerate(zip(all_ids, ents)):
+        if k >= n_s1:                                     # entity not in Source 1: its records are distractors
+            for vendor in (2, 3):
+                for _ in range(r.choice([0, 1, 1, 2, 2, 2, 3])):
+                    recs.append((vendor, e, None))
+            continue
+        if r.random() < 0.056:                            # real data: 5.6% singletons, ~3.5 matches
             continue
         for vendor in (2, 3):
-            for _ in range(r.choice([0, 1, 1, 1, 2, 2, 3])):
+            for _ in range(r.choice([0, 1, 1, 2, 2, 2, 3])):
                 recs.append((vendor, e, sid))
-    for _ in range(int(1.2 * n_s1)):                      # distractors not in Source 1
+    ents = ents[:n_s1]
+    for _ in range(int((1.2 if keep_frac >= 1 else 0.3) * n_s1)):     # distractors not in Source 1
         c = r.choices(countries, weights=[0.55, 0.35, 0.10][:len(countries)])[0]
         e = g.entity(c)
         if r.random() < 0.3:                              # near-duplicate of an existing entity
@@ -244,12 +354,16 @@ def main():
     ap.add_argument("--n-train", type=int, default=20000)
     ap.add_argument("--n-test", type=int, default=15000)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--hard", action="store_true",
+                    help="real-data noise: Indic-script English loanwords, domains, word drops/swaps, house-number "
+                         "typos, more empty addresses, and test Source 1 thinned so test has more distractors")
     a = ap.parse_args()
-    g = Gen(a.seed)
+    g = Gen(a.seed, hard=a.hard)
     for split, n, countries in [("train", a.n_train, ["US", "India"]), ("test", a.n_test, ["US", "India", "France"])]:
+        keep = (0.74 if split == "train" else 0.60) if a.hard else 1.0
         d = os.path.join(a.out, split)
         os.makedirs(d, exist_ok=True)
-        s1, s2, s3, gt = make_split(g, n, countries)
+        s1, s2, s3, gt = make_split(g, n, countries, keep)
         for k, df in [(1, s1), (2, s2), (3, s3)]:
             df.to_csv(os.path.join(d, f"{split}_source{k}.tsv"), sep="\t", index=False)
         gdir = d if split == "train" else os.path.join(a.out, "test_labels")

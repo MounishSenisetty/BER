@@ -36,7 +36,7 @@ try:
 except ImportError:  # small data still works with brute-force numpy search
     faiss = None
 
-BLOCKERS = ["b_knn_name", "b_knn_full", "b_key"]
+BLOCKERS = ["b_knn_name", "b_knn_full", "b_key", "b_knn_addr"]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -148,9 +148,12 @@ class CharSpace:
 # key index
 # ----------------------------------------------------------------------------------------------
 def make_keys(df: pd.DataFrame) -> List[List[str]]:
+    """Blocking keys per record. Name keys catch lexical overlap; address bigram and
+    acronym x address-number keys catch records whose name is a trade name or an acronym."""
     out = []
-    for ct, comp, ho, st, po, ft, mf in zip(df["core_toks"], df["compact"], df["house"], df["street"],
-                                             df["postal"], df["first_tok"], df["meta_first"]):
+    for ct, comp, ho, st, po, ft, mf, at, ini, nums in zip(
+            df["core_toks"], df["compact"], df["house"], df["street"], df["postal"], df["first_tok"],
+            df["meta_first"], df["addr_toks"], df["initials"], df["addr_nums"]):
         toks = list(dict.fromkeys(t for t in ct if len(t) >= 2 and not t.isdigit()))
         ks = ["t|" + t for t in toks]
         head = toks[:4]
@@ -167,6 +170,16 @@ def make_keys(df: pd.DataFrame) -> List[List[str]]:
             ks.append(f"mh|{mf}|{ho}")
         if st and ft:
             ks.append(f"sf|{st}|{ft}")
+        ks += [f"ab|{a}|{b}" for a, b in zip(at[:13], at[1:13]) if len(a) + len(b) >= 5]
+        acr = {x for x in (ini, comp if 2 <= len(comp) <= 5 and comp.isalpha() else "") if x}
+        ks += [f"ac|{x}|{n}" for x in acr for n in nums[:3]]
+        # generic / shared names ("Premier Impex" x30 in India) told apart by a place word: name x
+        # locality/city token. Also the compact name, so glued / domain names ("revitup") get them
+        if len(comp) >= 3:
+            loc = list(dict.fromkeys(t for t in at if len(t) >= 4 and t.isalpha()))[:10]
+            ks += [f"na|{comp}|{t}" for t in loc]
+            if toks:
+                ks += [f"fa|{toks[0]}|{t}" for t in loc if t != toks[0]]
         out.append(ks)
     return out
 
@@ -181,6 +194,7 @@ class RecordMats:
     addr_X: sp.csr_matrix
     name_D: np.ndarray
     full_D: np.ndarray
+    addr_D: Optional[np.ndarray] = None
 
 
 def _build_faiss(D: np.ndarray, cfg: BlockingConfig, seed: int):
@@ -191,14 +205,30 @@ def _build_faiss(D: np.ndarray, cfg: BlockingConfig, seed: int):
         index = faiss.IndexFlatIP(d)
         index.add(D)
         return index
-    nlist = int(min(65536, max(64, 4 * math.sqrt(N))))
+    nlist = int(min(65536, max(16, min(4 * math.sqrt(N), N / 50))))
     quantizer = faiss.IndexFlatIP(d)
     index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
     rng = np.random.default_rng(seed)
     index.train(D[rng.choice(N, size=min(N, nlist * 40), replace=False)])
     index.add(D)
     index.nprobe = cfg.faiss_nprobe
-    return index
+    return _maybe_gpu(index, cfg)
+
+
+def _maybe_gpu(index, cfg: BlockingConfig):
+    """Move an IVF index to the GPU(s) when a GPU build of FAISS sees one; otherwise keep the CPU
+    index. Results are the same search (same nprobe), only faster."""
+    if not getattr(cfg, "use_gpu", True) or not hasattr(faiss, "get_num_gpus"):
+        return index
+    try:
+        if faiss.get_num_gpus() < 1:
+            return index
+        gpu = faiss.index_cpu_to_all_gpus(index)
+        faiss.GpuParameterSpace().set_index_parameter(gpu, "nprobe", cfg.faiss_nprobe)
+        return gpu
+    except Exception as e:  # any GPU problem -> silently stay on CPU
+        LOG.warning("FAISS GPU unavailable (%s); using CPU index", e)
+        return index
 
 
 def _search(index, D_base: np.ndarray, Q: np.ndarray, k: int):
@@ -222,6 +252,18 @@ def _search(index, D_base: np.ndarray, Q: np.ndarray, k: int):
     return rows[ok], ids[ok].astype(np.int64), rank[ok]
 
 
+def _rank_within(g: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """1-based descending rank of x within groups g."""
+    order = np.lexsort((-x, g))
+    gs = g[order]
+    start = np.r_[True, gs[1:] != gs[:-1]]
+    first = np.flatnonzero(start)
+    pos = np.arange(len(g)) - first[np.cumsum(start) - 1]
+    rank = np.empty(len(g), dtype=np.int64)
+    rank[order] = pos + 1
+    return rank
+
+
 class CountryIndex:
     """Everything about one country's Source 1 partition needed for blocking and features."""
 
@@ -233,10 +275,19 @@ class CountryIndex:
         self.N = len(self.s1)
         self.name_space = CharSpace(cfg, dense=True, n_jobs=n_jobs)
         self.full_space = CharSpace(cfg, dense=True, n_jobs=n_jobs)
-        self.addr_space = CharSpace(cfg, dense=False, n_jobs=n_jobs)
+        self.use_addr_knn = getattr(cfg, "addr_topk", 0) > 0
+        self.addr_space = CharSpace(cfg, dense=self.use_addr_knn, n_jobs=n_jobs)
         self.name_X, self.name_D = self.name_space.fit_transform(self.s1["core"].tolist(), seed)
         self.full_X, self.full_D = self.full_space.fit_transform(self.s1["full"].tolist(), seed)
-        self.addr_X, _ = self.addr_space.fit_transform(self.s1["addr_n"].tolist(), seed)
+        self.addr_X, addr_D = self.addr_space.fit_transform(self.s1["addr_n"].tolist(), seed)
+        self.addr_index = None
+        if self.use_addr_knn:
+            # only Source 1 rows that have an address are searchable in address space
+            self.addr_rows = np.flatnonzero(self.s1["addr_n"].to_numpy(dtype=object) != "")
+            if len(self.addr_rows) >= 2:
+                self.addr_D_sub = np.ascontiguousarray(addr_D[self.addr_rows])
+                self.addr_index = _build_faiss(self.addr_D_sub, cfg, seed)
+            del addr_D
         self.name_index = _build_faiss(self.name_D, cfg, seed)
         self.full_index = _build_faiss(self.full_D, cfg, seed)
 
@@ -276,12 +327,26 @@ class CountryIndex:
         cfg = self.cfg
         name_X, name_D = self.name_space.transform(rc["core"].tolist())
         full_X, full_D = self.full_space.transform(rc["full"].tolist())
-        addr_X, _ = self.addr_space.transform(rc["addr_n"].tolist())
-        mats = RecordMats(name_X, full_X, addr_X, name_D, full_D)
+        addr_X, addr_D = self.addr_space.transform(rc["addr_n"].tolist())
+        mats = RecordMats(name_X, full_X, addr_X, name_D, full_D, addr_D)
         n = len(rc)
 
         r1, s1, k1 = _search(self.name_index, self.name_D, name_D, cfg.name_topk)
+        # records without an address can only be found by name: search much wider for them
+        no_addr = (rc["addr_n"].to_numpy(dtype=object) == "")
+        wide_k = getattr(cfg, "empty_addr_topk", 0)
+        if wide_k > cfg.name_topk and no_addr.any():
+            rows = np.flatnonzero(no_addr)
+            rw, sw, kw = _search(self.name_index, self.name_D, name_D[rows], wide_k)
+            r1, s1, k1 = np.concatenate([r1, rows[rw]]), np.concatenate([s1, sw]), np.concatenate([k1, kw])
         r2, s2, k2 = _search(self.full_index, self.full_D, full_D, cfg.full_topk)
+        # address-only neighbours: trade names, acronyms, domains and heavily mangled names are linked
+        # by the address alone, and a crowded name space never ranks them in its top 10
+        r4 = s4 = k4 = np.zeros(0, np.int64)
+        if self.use_addr_knn and getattr(self, "addr_D_sub", None) is not None and (~no_addr).any():
+            rows = np.flatnonzero(~no_addr)
+            ra, sa, ka = _search(self.addr_index, self.addr_D_sub, addr_D[rows], cfg.addr_topk)
+            r4, s4, k4 = rows[ra], self.addr_rows[sa], ka
 
         Q = self.hasher.transform(make_keys(rc)).tocsr()
         Q.data[:] = 1.0
@@ -297,35 +362,49 @@ class CountryIndex:
         k3 = np.concatenate(k3) if k3 else np.zeros(0, np.int64)
 
         # ---- union (vectorised de-duplication on a combined int64 key) ----
-        rec = np.concatenate([r1, r2, r3])
-        s1i = np.concatenate([s1, s2, s3])
-        src = np.concatenate([np.zeros(len(r1), np.int8), np.ones(len(r2), np.int8), np.full(len(r3), 2, np.int8)])
-        rnk = np.concatenate([k1, k2, k3]).astype(np.int32)
+        rec = np.concatenate([r1, r2, r3, r4])
+        s1i = np.concatenate([s1, s2, s3, s4])
+        src = np.concatenate([np.zeros(len(r1), np.int8), np.ones(len(r2), np.int8), np.full(len(r3), 2, np.int8),
+                              np.full(len(r4), 3, np.int8)])
+        rnk = np.concatenate([k1, k2, k3, k4]).astype(np.int32)
         key = rec * self.N + s1i
         uniq, inv = np.unique(key, return_inverse=True)
         m = len(uniq)
         big = np.int32(1_000)
-        ranks = np.full((3, m), big, dtype=np.int32)
-        for b in range(3):
+        ranks = np.full((4, m), big, dtype=np.int32)
+        for b in range(4):
             sel = src == b
             np.minimum.at(ranks[b], inv[sel], rnk[sel])
         cand = pd.DataFrame({"rec": (uniq // self.N).astype(np.int64), "s1": (uniq % self.N).astype(np.int64)})
         cand["b_knn_name"] = (ranks[0] < big).astype(np.int8)
         cand["b_knn_full"] = (ranks[1] < big).astype(np.int8)
         cand["b_key"] = (ranks[2] < big).astype(np.int8)
-        cand["knn_name_rank"] = np.minimum(ranks[0], cfg.name_topk + 1)
+        cand["knn_name_rank"] = np.minimum(ranks[0], max(cfg.name_topk, wide_k) + 1)
         cand["knn_full_rank"] = np.minimum(ranks[1], cfg.full_topk + 1)
         cand["key_rank"] = np.minimum(ranks[2], cfg.key_topk + 1)
-        cand["n_blockers"] = (cand["b_knn_name"] + cand["b_knn_full"] + cand["b_key"]).astype(np.int8)
+        cand["b_knn_addr"] = (ranks[3] < big).astype(np.int8)
+        cand["knn_addr_rank"] = np.minimum(ranks[3], getattr(cfg, "addr_topk", 0) + 1)
+        cand["n_blockers"] = (cand["b_knn_name"] + cand["b_knn_full"] + cand["b_key"]
+                              + cand["b_knn_addr"]).astype(np.int8)
 
         ia, ib = cand["s1"].to_numpy(), cand["rec"].to_numpy()
         cand["cos_name_d"] = dense_rowdot(self.name_D, name_D, ia, ib)
         cand["cos_full_d"] = dense_rowdot(self.full_D, full_D, ia, ib)
         cand["key_score"] = rowwise_dot(self.key_W, Q, ia, ib)
-        cand["cheap"] = (0.4 * cand["cos_name_d"] + 0.4 * cand["cos_full_d"]
-                         + 0.2 * np.tanh(cand["key_score"] / 10.0) + 0.01 * cand["n_blockers"]).astype(np.float32)
+        cand["cos_addr_c"] = rowwise_dot(self.addr_X, addr_X, ia, ib)
+        cand["cheap"] = (0.3 * cand["cos_name_d"] + 0.3 * cand["cos_full_d"] + 0.25 * cand["cos_addr_c"]
+                         + 0.15 * np.tanh(cand["key_score"] / 10.0) + 0.01 * cand["n_blockers"]).astype(np.float32)
 
-        cand = cand.sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
-        cand["cheap_rank"] = (cand.groupby("rec").cumcount() + 1).astype(np.int16)
-        cand = cand[cand["cheap_rank"] <= cfg.max_candidates_per_record].reset_index(drop=True)
-        return cand, mats
+        # keep the top-K by the cheap score, plus a few address / key specialists per record so that
+        # trade names and acronyms (name says nothing, address says everything) are not capped away
+        rec_arr = cand["rec"].to_numpy()
+        cand["cheap_rank"] = _rank_within(rec_arr, cand["cheap"].to_numpy()).astype(np.int16)
+        addr_rank = _rank_within(rec_arr, cand["cos_addr_c"].to_numpy())
+        cap = np.where(no_addr[rec_arr], getattr(cfg, "empty_addr_keep", cfg.max_candidates_per_record),
+                       cfg.max_candidates_per_record)
+        keep = ((cand["cheap_rank"].to_numpy() <= cap)
+                | ((addr_rank <= cfg.addr_keep) & (cand["cos_addr_c"].to_numpy() >= cfg.addr_keep_min_cos))
+                | (cand["key_rank"].to_numpy() <= cfg.key_keep))
+        self.last_union = (rec_arr, cand["s1"].to_numpy())      # pre-cap union (training diagnostics)
+        cand = cand[keep].sort_values(["rec", "cheap"], ascending=[True, False], kind="stable")
+        return cand.reset_index(drop=True), mats

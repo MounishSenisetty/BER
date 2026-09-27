@@ -22,17 +22,24 @@ class BlockingConfig:
     svd_dim: int = 128
     svd_fit_rows: int = 300_000
     faiss_nprobe: int = 24
+    use_gpu: bool = True                 # use FAISS-GPU when installed and a GPU is visible
     exact_knn_below: int = 20_000        # smaller S1 partitions use exact (flat) search
     name_topk: int = 10                  # S1 neighbours per record, name space
     full_topk: int = 10                  # S1 neighbours per record, name+address space
 
     # --- sparse key index: rare tokens, token pairs, phonetic/address compound keys ---
     key_max_df: int = 100                # drop keys shared by more S1 rows than this
-    key_topk: int = 10
+    key_topk: int = 15
     key_hash_features: int = 2 ** 23
 
     # --- final budget: union re-ranked by a cheap score and capped per record ---
     max_candidates_per_record: int = 10
+    addr_keep: int = 3                   # + best-address candidates (trade names / acronyms) ...
+    addr_keep_min_cos: float = 0.5       # ... when their address cosine is at least this
+    key_keep: int = 2                    # + best key-overlap candidates
+    empty_addr_topk: int = 40            # records with no address: wider name search ...
+    empty_addr_keep: int = 25            # ... and a larger candidate budget
+    addr_topk: int = 10                  # S1 neighbours per record in address space (0 = off)
 
 
 @dataclass
@@ -40,6 +47,7 @@ class ModelConfig:
     n_folds: int = 5
     seed: int = 42
     train_entities: int = 120_000        # S1 entities sampled for training (0 = all)
+    backend: str = "auto"                # auto = XGBoost on GPU if available, else LightGBM (CPU)
     num_boost_round: int = 2000
     early_stopping_rounds: int = 100
     params: dict = field(default_factory=lambda: {

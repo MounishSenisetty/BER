@@ -139,7 +139,7 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
         return rcols[c][ib]
 
     # ---- blocking provenance / dense cosines ----------------------------------------------
-    for c in BLOCKERS + ["n_blockers", "knn_name_rank", "knn_full_rank", "key_rank", "cheap", "cheap_rank",
+    for c in BLOCKERS + ["n_blockers", "knn_name_rank", "knn_full_rank", "key_rank", "knn_addr_rank", "cheap", "cheap_rank",
                          "cos_name_d", "cos_full_d", "key_score"]:
         F[c] = cand[c].to_numpy()
     F["rec_source"] = rc["source"].to_numpy()[ib].astype(np.int8)
@@ -149,7 +149,8 @@ def compute_features(idx: CountryIndex, rc: pd.DataFrame, cand: pd.DataFrame, ma
     # ---- exact sparse tf-idf cosines ------------------------------------------------------
     F["cos_name_c"] = rowwise_dot(idx.name_X, mats.name_X, ia, ib)
     F["cos_full_c"] = rowwise_dot(idx.full_X, mats.full_X, ia, ib)
-    F["cos_addr_c"] = rowwise_dot(idx.addr_X, mats.addr_X, ia, ib)
+    F["cos_addr_c"] = cand["cos_addr_c"].to_numpy() if "cos_addr_c" in cand else \
+        rowwise_dot(idx.addr_X, mats.addr_X, ia, ib)
 
     # ---- token-set overlaps (chunk-local incidence, global idf) ---------------------------
     u1, ja = np.unique(ia, return_inverse=True)

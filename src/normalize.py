@@ -43,7 +43,7 @@ LEGAL_SUFFIXES = {
     "company", "plc", "pllc", "pc", "pa", "dba", "the", "and", "of",
     # India (incl. transliterated Devanagari forms produced by translit())
     "pvt", "private", "public", "opc", "praivet", "privet", "limited", "limitd", "elelpi",
-    "kampani", "pablik", "ltda", "p", "elaelapi", "elelapi", "limitd", "praivhet",
+    "kampani", "pablik", "ltda", "p", "td", "lt", "pvtltd", "elaelapi", "elelapi", "limitd", "praivhet",
     # France
     "sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scp", "scop", "selarl", "selas", "sca",
     "gie", "eirl", "ei", "cie", "compagnie", "societe", "et", "de", "du", "des", "la", "le", "les",
@@ -53,20 +53,9 @@ LEGAL_SUFFIXES = {
 # long legal words also matched with typos ("Limied", "PIRVATE", "Incorprated"), plus 3-letter
 # abbreviations with swapped letters ("Ldt", "Ptv") -- otherwise a mistyped legal form stays in
 # the core name and looks like the unexplained extra token of a branch distractor
-_LEGAL_FUZZY = ("limited", "private", "company", "corporation", "incorporated", "compagnie", "societe")
+_LEGAL_FUZZY = ("limited", "private", "company", "corporation", "incorporated", "compagnie", "societe",
+                "partnership")
 _LEGAL_ANAGRAM = {"".join(sorted(w)): w for w in ("ltd", "pvt")}
-
-
-@lru_cache(maxsize=1_000_000)
-def is_legal(tok: str) -> bool:
-    if tok in LEGAL_SUFFIXES:
-        return True
-    if len(tok) == 3:
-        return "".join(sorted(tok)) in _LEGAL_ANAGRAM
-    if len(tok) < 6:
-        return False
-    return any(OSA.distance(tok, w, score_cutoff=1 if len(w) < 9 else 2) <= (1 if len(w) < 9 else 2)
-               for w in _LEGAL_FUZZY if abs(len(w) - len(tok)) <= 2)
 
 
 # legal forms as they appear with broken spacing / typos at either edge of a name:
@@ -144,6 +133,34 @@ def canon_legal(s: str) -> str:
 
 
 WEB_TOKENS = {"www", "http", "https"}
+HONORIFICS = {"smt", "shrimati", "mr", "mrs", "kumari", "sh"}
+_NOT_LEGAL = {"privacy", "privilege", "privileged", "privy", "limitless", "corporate", "companion", "companions"}
+
+
+@lru_cache(maxsize=1_000_000)
+def is_legal(t: str) -> bool:
+    """Legal-form token, tolerating the misspellings seen in the data (Privhea, Liimted, Limitend,
+    Incorprated) and 3-letter abbreviations with swapped letters (Ldt, Ptv)."""
+    if t in LEGAL_SUFFIXES:
+        return True
+    if len(t) == 3:
+        return "".join(sorted(t)) in _LEGAL_ANAGRAM
+    if len(t) < 6 or not t.isalpha() or t in _NOT_LEGAL:
+        return False
+    if t.startswith(("priv", "praiv", "pirai", "limit", "lmit", "incorp", "corpor")):
+        return True
+    return any(OSA.distance(t, w, score_cutoff=1 if len(w) < 9 else 2) <= (1 if len(w) < 9 else 2)
+               for w in _LEGAL_FUZZY if abs(len(w) - len(t)) <= 2)
+
+
+_RE_LEET = re.compile(r"(?<=[A-Za-z])[01](?=[A-Za-z])|\b[0156](?=[A-Za-z]{2,})(?!(?:st|nd|rd|th)\b)")
+_LEET = {"0": "o", "1": "l", "5": "s", "6": "g"}
+
+
+def _unleet(m) -> str:
+    return _LEET[m.group(0)]
+
+
 NULL_TOKENS = {"null", "none", "nan", "nil", "undefined"}
 
 ABBREV_COMMON = {
@@ -168,6 +185,12 @@ ABBREV_COMMON = {
     "mount": "mt", "fort": "ft",
     "north": "n", "south": "s", "east": "e", "west": "w", "northeast": "ne", "northwest": "nw",
     "southeast": "se", "southwest": "sw",
+    # ordinal words -> digit ordinals ("531 FIFTEENTH AVE" == "531 15th Avenue")
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th", "sixth": "6th",
+    "seventh": "7th", "eighth": "8th", "ninth": "9th", "tenth": "10th", "eleventh": "11th",
+    "twelfth": "12th", "thirteenth": "13th", "fourteenth": "14th", "fifteenth": "15th",
+    "sixteenth": "16th", "seventeenth": "17th", "eighteenth": "18th", "nineteenth": "19th",
+    "twentieth": "20th", "thirtieth": "30th", "fortieth": "40th", "fiftieth": "50th",
 }
 ABBREV_COUNTRY = {
     "india": {
@@ -333,11 +356,34 @@ _RE_ALPHA_DIGIT = re.compile(r"(?<=[^\W\d_]{3})(?=\d)|(?<=\d)(?=[^\W\d_]{3})", r
 _RE_NUM = re.compile(r"^\d+[a-z]?$")
 
 
+# native-script word -> Latin form, learned from the training ground truth (src/lexicon.py);
+# set once per process (train / inference and every normalisation worker) before prepare()
+_LEXICON: Dict[str, str] = {}
+_RE_INDIC_WORD = re.compile("[\u0900-\u0DFF\u200b-\u200d]+")
+
+
+def set_lexicon(lex) -> None:
+    global _LEXICON
+    _LEXICON = dict(lex or {})
+
+
+def get_lexicon() -> Dict[str, str]:
+    return _LEXICON
+
+
+def _lex_sub(m) -> str:
+    from .lexicon import native_key
+    v = _LEXICON.get(native_key(m.group(0)))
+    return f" {v} " if v else m.group(0)
+
+
 def clean(s: str) -> str:
     """Script/format normalisation shared by names and addresses. Returns lowercase ASCII-ish text."""
     if not isinstance(s, str) or not s:
         return ""
     if _RE_INDIC.search(s):
+        if _LEXICON:
+            s = _RE_INDIC_WORD.sub(_lex_sub, s)
         s = _translit_runs(s)
     s = _RE_URL.sub(r"\1", s)
     s = _RE_DOTTED.sub(lambda m: m.group(0).replace(".", ""), s)
@@ -353,12 +399,17 @@ def country_key(country: str) -> str:
     return (country or "").strip().lower()
 
 
+_RE_LEAD_ZEROS = re.compile(r"^0+(?=\d)")
+
+
 def tokens(s: str, country: str = "") -> List[str]:
     table = ABBREV_COUNTRY.get(country_key(country))
     out = []
     for t in clean(s).split():
         if t in NULL_TOKENS:
             continue
+        if t[0] == "0":
+            t = _RE_LEAD_ZEROS.sub("", t)          # "002839" -> "2839", "00540k" -> "540k"
         if table is not None:                   # country table first, then the shared canonical
             t = table.get(t, t)                 # forms: FR "pl." -> place -> pl == "Place" -> pl
         t = ABBREV_COMMON.get(t, t)
@@ -379,7 +430,17 @@ def address_tokens(s: str, country: str = "") -> List[str]:
     if st is not None:
         rx, table = st
         c = rx.sub(lambda m: table[m.group(1)], c)
-    return [t for t in tokens(c, country) if t not in WEB_TOKENS]
+    toks = [t for t in tokens(c, country) if t not in WEB_TOKENS]
+    # drop "PO BOX 4442" / "P O BOX 12": mailing boxes are noise added to street addresses
+    out, i = [], 0
+    while i < len(toks):
+        if toks[i] == "box" and out and out[-1] == "po" or (toks[i] == "box" and out[-2:] == ["p", "o"]):
+            out = out[:-1] if out[-1] == "po" else out[:-2]
+            i += 2 if i + 1 < len(toks) and toks[i + 1].isdigit() else 1
+            continue
+        out.append(toks[i])
+        i += 1
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -500,8 +561,11 @@ def _india_phonetic(tok: str) -> str:
 
 def _prep_one(name: str, address: str, country: str):
     ckey = country_key(country)
-    nt = [t for t in tokens(name, ckey) if t not in WEB_TOKENS]
-    legal = [is_legal(t) for t in nt]            # before phonetics mangle typos ("lximited")
+    nt = [t for t in tokens(_RE_LEET.sub(_unleet, name or ""), ckey) if t not in WEB_TOKENS]
+    if len(nt) > 2 and nt[0] == "m" and nt[1] == "s":            # "M/s Foo Traders"
+        nt = nt[2:]
+    drop = HONORIFICS | ({"pra", "li"} if ckey == "india" else set())    # India: "प्रा. लि." = Pvt. Ltd.
+    legal = [is_legal(t) or t in drop for t in nt]      # before phonetics mangle typos ("lximited")
     keep = _peel_legal_edges(nt, legal, fr=ckey == "france")
     raw = nt
     if ckey == "india":
@@ -510,7 +574,7 @@ def _prep_one(name: str, address: str, country: str):
     ct = [nt[i] for i in kept] or nt
     kept_set = set(kept)
     lform = canon_legal("".join(raw[i] for i in range(len(raw)) if i not in kept_set
-                                and raw[i] not in _LEGAL_STOP)) if kept else ""
+                                and raw[i] not in _LEGAL_STOP and raw[i] not in drop)) if kept else ""
     at = address_tokens(address, ckey)
     core = " ".join(ct)
     addr = " ".join(at)
@@ -538,7 +602,8 @@ def prepare(df: pd.DataFrame, n_jobs: int = -1, block: int = 50_000) -> pd.DataF
     jobs = [(names[i:i + block], addrs[i:i + block], ctry[i:i + block]) for i in range(0, len(out), block)]
     n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs)), initializer=set_lexicon,
+                                 initargs=(_LEXICON,)) as ex:
             parts = list(ex.map(_prep_block, jobs))
     else:
         parts = [_prep_block(j) for j in jobs]
