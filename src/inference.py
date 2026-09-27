@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--s1"), ap.add_argument("--s2"), ap.add_argument("--s3"), ap.add_argument("--gt")
     ap.add_argument("--threshold", type=float, default=None, help="override the tuned threshold")
     ap.add_argument("--chunk-records", type=int, default=None)
+    ap.add_argument("--n-jobs", type=int, default=None,
+                    help="max CPU workers / threads (default: all cores, capped at 32; env BER_MAX_THREADS)")
     ap.add_argument("--dump-scores", action="store_true", help="also write pair_scores.tsv")
     args = ap.parse_args()
     setup_logging()
@@ -45,6 +47,8 @@ def main():
     cfg = bundle["config"]
     set_lexicon(bundle.get("lexicon"))
     LOG.info("Transliteration lexicon: %d entries", len(bundle.get("lexicon") or {}))
+    if args.n_jobs:
+        os.environ["BER_MAX_THREADS"] = str(args.n_jobs)
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
     rule = dict(bundle["decision"])

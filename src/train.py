@@ -31,13 +31,13 @@ from sklearn.model_selection import KFold, StratifiedKFold
 
 from .config import PipelineConfig
 from .features import compute_features
-from .model import Ensemble, resolve_backend, train_fold
+from .model import Ensemble, resolve_backend, train_fold, train_fold_idx
 from .stage2 import RAW, GroupStats, stage2_frame
 from .cross_encoder import CEConfig, assemble, ce_features, config_dict, encode_rows, score_pairs, torch_device, train_model
 from .diagnostics import loss_report
 from .lexicon import learn_from_split
 from .normalize import set_lexicon
-from .pipeline import restrict_countries, auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
+from .pipeline import subset_by_state, restrict_countries, auto_s1_drop, entity_true_counts, iter_chunks, load_split, owner_array, thin_source1
 from .postprocess import search_decision, select
 from .utils import peak_memory_gb, LOG, fast_macro_f05, setup_logging, timer
 
@@ -113,6 +113,8 @@ def main():
     ap.add_argument("--train-entities", type=int, default=None, help="S1 entities to featurise (0 = all)")
     ap.add_argument("--max-candidates", type=int, default=None, help="candidates kept per record")
     ap.add_argument("--chunk-records", type=int, default=None)
+    ap.add_argument("--n-jobs", type=int, default=None,
+                    help="max CPU workers / threads (default: all cores, capped at 32; env BER_MAX_THREADS)")
     ap.add_argument("--backend", choices=["auto", "xgboost", "lightgbm"], default=None)
     ap.add_argument("--cache-dir", default="/tmp/ber_stage2_cache",
                     help="scratch space for competitor-pair features (stage 2), ~10 GB on the full data")
@@ -125,11 +127,19 @@ def main():
                          "(default: auto from the test split's records-per-entity ratio; 0 = off)")
     ap.add_argument("--no-lexicon", action="store_true", help="do not learn the transliteration lexicon")
     ap.add_argument("--countries", default=None, help="comma-separated country labels to train on (quick experiments)")
+    ap.add_argument("--train-state-frac", type=float, default=1.0,
+                    help="train on a random fraction of whole states (e.g. 0.5 halves training time; look-alike "
+                         "density within a state is unchanged)")
     ap.add_argument("--cross-encoder", choices=["auto", "on", "off"], default="auto",
                     help="char-level transformer cross-encoder as a stage-2 feature (auto = only with a CUDA GPU)")
     ap.add_argument("--ce-epochs", type=float, default=None)
     ap.add_argument("--ce-max-train-pairs", type=int, default=None)
     ap.add_argument("--ce-small", action="store_true", help="tiny cross-encoder (CPU smoke tests)")
+    ap.add_argument("--ce-backbone", default="",
+                    help="fine-tune a pretrained Hugging Face model as the cross-encoder instead of the from-scratch "
+                         "character model, e.g. microsoft/deberta-v3-small or intfloat/multilingual-e5-small "
+                         "(both MIT; a local path works offline)")
+    ap.add_argument("--ce-max-len", type=int, default=None, help="token budget per pair for --ce-backbone (default 96)")
     ap.add_argument("--final", choices=["auto", "stage1", "stage2", "stage2+ce"], default="auto",
                     help="model variant to ship (auto = best nested-CV macro F0.5)")
     args = ap.parse_args()
@@ -143,6 +153,8 @@ def main():
         cfg.model.train_entities = args.train_entities
     if args.max_candidates:
         cfg.blocking.max_candidates_per_record = args.max_candidates
+    if args.n_jobs:
+        os.environ["BER_MAX_THREADS"] = str(args.n_jobs)
     if args.chunk_records:
         cfg.blocking.chunk_records = args.chunk_records
     if args.backend:
@@ -159,6 +171,8 @@ def main():
         with timer("Learning the transliteration lexicon"):
             lexicon = learn_from_split(split, n_jobs=cfg.n_jobs, seed=cfg.model.seed)
         set_lexicon(lexicon)
+    if args.train_state_frac < 1:
+        split = subset_by_state(split, args.train_state_frac, cfg.model.seed)
     s1_drop = args.s1_drop
     if s1_drop is None:
         test_dir = args.test_dir or os.path.join(os.path.dirname(os.path.abspath(args.data_dir.rstrip("/"))), "test")
@@ -182,6 +196,12 @@ def main():
     rec_fmax = np.full(len(split.rec), -1, dtype=np.int8)
     use_s2 = not args.no_stage2
     ce_cfg = CEConfig(seed=cfg.model.seed)
+    if args.ce_backbone:                   # fine-tuning recipe for a pretrained backbone
+        ce_cfg.backbone = args.ce_backbone
+        ce_cfg.lr, ce_cfg.batch_size, ce_cfg.epochs, ce_cfg.warmup_steps = 3e-5, 64, 1.0, 300
+        ce_cfg.max_train_pairs = 600_000
+        if args.ce_max_len:
+            ce_cfg.max_len = args.ce_max_len
     if args.ce_epochs:
         ce_cfg.epochs = args.ce_epochs
     if args.ce_max_train_pairs:
@@ -191,7 +211,8 @@ def main():
         ce_cfg.name_len, ce_cfg.addr_len, ce_cfg.warmup_steps = 32, 48, 50
     dev = torch_device()
     use_ce = use_s2 and (args.cross_encoder == "on" and dev != "none" or args.cross_encoder == "auto" and dev == "cuda")
-    LOG.info("Cross-encoder: %s (torch device: %s)", "on" if use_ce else "off", dev)
+    LOG.info("Cross-encoder: %s (torch device: %s, backbone: %s)", "on" if use_ce else "off", dev,
+             ce_cfg.backbone or "char transformer from scratch")
     if use_s2:
         shutil.rmtree(args.cache_dir, ignore_errors=True)
         os.makedirs(args.cache_dir, exist_ok=True)
@@ -237,7 +258,8 @@ def main():
         with timer(f"  features for {len(cand)} pairs"):
             X = compute_features(ch.idx, ch.rc, cand, ch.mats, n_jobs=cfg.n_jobs)
         keep = e[sub]
-        Xs.append(X[keep].reset_index(drop=True))
+        feat_names = list(X.columns)
+        Xs.append(X.to_numpy(np.float32)[keep])        # plain float32 rows: no pandas overhead / copies
         ys.append(y[sub][keep])
         s1s.append(gs1[sub][keep])
         recs.append(grec[sub][keep])
@@ -273,12 +295,24 @@ def main():
         md.to_csv(os.path.join(args.model_dir, "blocking_misses.tsv"), sep="\t", index=False)
         LOG.info("Sampled blocking misses -> blocking_misses.tsv: %s", md["reason"].value_counts().to_dict())
 
-    X = pd.concat(Xs, ignore_index=True)
+    # the last chunk still holds a whole country index (several GB): release it before the model stage
+    del ch
+    import gc
+    gc.collect()
+    # one float32 matrix, filled chunk by chunk (never two full copies in memory)
+    X = np.empty((sum(len(a) for a in Xs), len(feat_names)), dtype=np.float32)
+    at = 0
+    while Xs:
+        part = Xs.pop(0)
+        X[at:at + len(part)] = part
+        at += len(part)
+        del part
+    gc.collect()
     y = np.concatenate(ys)
     ps1 = np.concatenate(s1s)
     prec = np.concatenate(recs)
-    del Xs
-    LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d", len(y), y.sum(), 100 * y.mean(), X.shape[1])
+    LOG.info("Training pairs: %d | positives: %d (%.2f%%) | features: %d (%.1f GB) | memory: %s", len(y), y.sum(),
+             100 * y.mean(), X.shape[1], X.nbytes / 1e9, peak_memory_gb())
 
     # ------------------------------------------------------------ entity-grouped CV
     ent = e_local[ps1]
@@ -288,9 +322,9 @@ def main():
     models, imps, best_iters = [], [], []
     backend = resolve_backend(cfg.model.backend)
     for f in range(cfg.model.n_folds):
-        tr, va = pair_fold != f, pair_fold == f
-        with timer(f"Fold {f}: train {tr.sum()} / valid {va.sum()} pairs"):
-            m, oof[va], imp_f = train_fold(backend, cfg.model, X[tr], y[tr], X[va], y[va])
+        tr, va = np.flatnonzero(pair_fold != f), np.flatnonzero(pair_fold == f)
+        with timer(f"Fold {f}: train {len(tr)} / valid {len(va)} pairs"):
+            m, oof[va], imp_f = train_fold_idx(backend, cfg.model, X, y, tr, va, feat_names)
             LOG.info("  best_iter=%d  valid logloss=%.5f", m[2], log_loss(y[va], oof[va], labels=[0, 1]))
         models.append(m)
         best_iters.append(int(m[2]))
@@ -338,7 +372,7 @@ def main():
         return {"best": best, "curve": curve, "sel": sel, "tuned": tuned, "nested": nested_score,
                 "nested_per_fold": nested}
 
-    feats_all = list(X.columns)
+    feats_all = list(feat_names)
     ev1 = evaluate(oof, "stage1")
     final, final_prob, s2_models, s2_features, ev2 = ev1, oof, None, None, None
     variant_scores = {"stage1": ev1["nested"]}
@@ -348,9 +382,8 @@ def main():
     # ------------------------------------------------------------ stage 2 (competitor-aware re-scoring)
     if use_s2:
         import gc
-        feats = list(X.columns)
-        raw_E = {k: X[k].to_numpy(np.float16) for k in RAW}      # float16, exactly as stored at inference
-        n_features = X.shape[1]
+        feats = list(feat_names)
+        raw_E = {k: X[:, feats.index(k)].astype(np.float16) for k in RAW}   # float16, as stored at inference
         del X
         gc.collect()
         ens_all = Ensemble(models)

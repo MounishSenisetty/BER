@@ -22,8 +22,7 @@ automatically from the test split's row counts).
 - Strategy: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Methodology write-up: [`Documentation_template.md`](Documentation_template.md)
 
-**Kaggle (GPU):** [`notebooks/kaggle_gpu.ipynb`](notebooks/kaggle_gpu.ipynb). Its cells clone this
-branch, install the extra packages, locate the dataset, train, run inference, validate and package the
+**Kaggle (GPU):** [`notebooks/kaggle_gpu.ipynb`](notebooks/kaggle_gpu.ipynb). Its cells clone `main`, install the extra packages, locate the dataset, train, run inference, validate and package the
 submission.
 
 **How high can the score go?** On the training split, 39.6 % of Source 1 names are shared by more
@@ -57,6 +56,12 @@ Useful flags:
 - `--cross-encoder auto|on|off`: transformer cross-encoder stacked into stage 2 (`auto` = only when a
   CUDA GPU is visible). It is kept only if it beats stage 2 without it on nested CV.
   `--ce-epochs`, `--ce-max-train-pairs` size its training.
+- `--ce-backbone NAME_OR_PATH`: fine-tune a **pretrained** Hugging Face model as the cross-encoder
+  instead of the character transformer trained from scratch. Recommended: `intfloat/e5-small-v2`
+  (MIT, 33M, fast) or `microsoft/deberta-v3-small` (MIT, stronger, ~2-3x slower); both are within the
+  challenge's MIT/Apache <= 8B rule. It uses the same protocol: two models on disjoint fold halves,
+  out-of-fold scores, only pairs with stage-1 p >= 0.01, kept only if it wins nested CV. A local path
+  works offline, for example with weights attached as a Kaggle dataset.
 - `--no-lexicon`: skip the learned transliteration lexicon.
 
 Training ends with a **loss report**, which is also saved as `models/loss_report.tsv`. It gives the
@@ -109,5 +114,7 @@ Licences:
 - rapidfuzz: MIT.
 - scikit-learn: BSD.
 
-No pretrained models are used (the cross-encoder is trained from scratch on the training split), and no
-external data or services are called. PyTorch (BSD) is used for the cross-encoder.
+By default no pretrained models are used (the cross-encoder is trained from scratch on the training
+split). With `--ce-backbone`, a pretrained MIT/Apache-2.0 model is fine-tuned on the training split;
+no external data, lookups or services are used either way. PyTorch (BSD) and Hugging Face
+Transformers (Apache-2.0) run the cross-encoder.

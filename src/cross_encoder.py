@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .utils import LOG
+from .utils import cpu_limit, LOG
 
 PAD, CLS, UNK = 0, 1, 2
 _CHARS = " abcdefghijklmnopqrstuvwxyz0123456789"
@@ -60,6 +60,10 @@ class CEConfig:
     easy_neg_frac: float = 0.05          # ... and only this fraction of them is used
     min_p: float = 0.01                  # pairs scored by the cross-encoder (train and test alike)
     seed: int = 42
+    # pretrained backbone (Hugging Face id or local path, e.g. microsoft/deberta-v3-small); "" = the
+    # from-scratch character model above
+    backbone: str = ""
+    max_len: int = 96                    # word-piece tokens per pair (pretrained backbone only)
 
     @property
     def seq_len(self) -> int:
@@ -96,7 +100,7 @@ def encode_texts(texts: Sequence[str], width: int, n_jobs: int = -1, block: int 
     texts = [t if isinstance(t, str) else "" for t in texts]
     lex = get_lexicon()
     jobs = [(texts[i:i + block], width, lex) for i in range(0, len(texts), block)]
-    n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
             parts = list(ex.map(_encode_block, jobs))
@@ -105,12 +109,52 @@ def encode_texts(texts: Sequence[str], width: int, n_jobs: int = -1, block: int 
     return np.concatenate(parts) if parts else np.zeros((0, width), np.uint8)
 
 
+def _clean_block(args):
+    from .normalize import clean, set_lexicon
+    texts, lex = args
+    if lex is not None:
+        set_lexicon(lex)
+    return [clean(t) for t in texts]
+
+
+def clean_texts(texts: Sequence[str], n_jobs: int = -1, block: int = 100_000) -> List[str]:
+    """normalize.clean (transliteration + learned lexicon) over many texts, in parallel."""
+    from .normalize import get_lexicon
+    texts = [t if isinstance(t, str) else "" for t in texts]
+    jobs = [(texts[i:i + block], get_lexicon()) for i in range(0, len(texts), block)]
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
+    if n_jobs > 1 and len(jobs) > 1:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
+            parts = list(ex.map(_clean_block, jobs))
+    else:
+        parts = [_clean_block(j) for j in jobs]
+    return [t for part in parts for t in part]
+
+
 class TextTable:
-    """Encoded name / address of a set of rows (Source 1 or records), looked up by row index."""
+    """Encoded name / address of a set of rows (Source 1 or records), looked up by row index:
+    fixed-width char ids for the character model, "name ; address" strings for a pretrained one."""
 
     def __init__(self, names: Sequence[str], addrs: Sequence[str], cfg: CEConfig, n_jobs: int = -1):
-        self.name = encode_texts(names, cfg.name_len, n_jobs)
-        self.addr = encode_texts(addrs, cfg.addr_len, n_jobs)
+        if cfg.backbone:
+            n, a = clean_texts(names, n_jobs), clean_texts(addrs, n_jobs)
+            self.text = np.asarray([f"{x} ; {y}" if y else x for x, y in zip(n, a)] + [None], dtype=object)[:-1]
+        else:
+            self.name = encode_texts(names, cfg.name_len, n_jobs)
+            self.addr = encode_texts(addrs, cfg.addr_len, n_jobs)
+
+
+class PairText:
+    """(Source 1 text, record text) pairs for a pretrained backbone; indexable like an array."""
+
+    def __init__(self, a: np.ndarray, b: np.ndarray):
+        self.a, self.b = a, b
+
+    def __len__(self):
+        return len(self.a)
+
+    def __getitem__(self, idx):
+        return PairText(self.a[idx], self.b[idx])
 
 
 def encode_rows(frame, rows: np.ndarray, cfg: CEConfig, n_jobs: int = -1):
@@ -121,7 +165,9 @@ def encode_rows(frame, rows: np.ndarray, cfg: CEConfig, n_jobs: int = -1):
     return rows, t
 
 
-def assemble(t1: TextTable, i1: np.ndarray, t2: TextTable, i2: np.ndarray) -> np.ndarray:
+def assemble(t1: TextTable, i1: np.ndarray, t2: TextTable, i2: np.ndarray):
+    if hasattr(t1, "text"):
+        return PairText(t1.text[i1], t2.text[i2])
     n = len(i1)
     cls = np.full((n, 1), CLS, dtype=np.uint8)
     return np.concatenate([cls, t1.name[i1], t1.addr[i1], t2.name[i2], t2.addr[i2]], axis=1)
@@ -206,16 +252,69 @@ def _unwrap(model):
     return model.module if hasattr(model, "module") else model
 
 
-def train_model(X: np.ndarray, y: np.ndarray, cfg: CEConfig, tag: str = "",
-                X_val: Optional[np.ndarray] = None, y_val: Optional[np.ndarray] = None) -> bytes:
-    """Train one cross-encoder on assembled pair matrices; returns the serialized state dict."""
+_TOKENIZERS: Dict[str, object] = {}
+
+
+def _tokenizer(cfg: CEConfig):
+    if cfg.backbone not in _TOKENIZERS:
+        from transformers import AutoTokenizer
+        _TOKENIZERS[cfg.backbone] = AutoTokenizer.from_pretrained(cfg.backbone)
+    return _TOKENIZERS[cfg.backbone]
+
+
+def _build_pretrained(cfg: CEConfig, weights: bool):
+    """Sequence-classification head (1 logit) on a Hugging Face backbone. `weights=False` builds the
+    architecture only (the fine-tuned weights come from the model bundle)."""
+    import torch.nn as nn
+    from transformers import AutoConfig, AutoModelForSequenceClassification
+    if weights:
+        m = AutoModelForSequenceClassification.from_pretrained(cfg.backbone, num_labels=1, ignore_mismatched_sizes=True)
+    else:
+        m = AutoModelForSequenceClassification.from_config(AutoConfig.from_pretrained(cfg.backbone, num_labels=1))
+
+    class Head(nn.Module):                     # returns a plain logit tensor (DataParallel-friendly)
+        def __init__(self):
+            super().__init__()
+            self.m = m
+
+        def forward(self, input_ids, attention_mask, token_type_ids=None):
+            kw = {"token_type_ids": token_type_ids} if token_type_ids is not None else {}
+            return self.m(input_ids=input_ids, attention_mask=attention_mask, **kw).logits.squeeze(-1)
+
+    return Head()
+
+
+def _new_model(cfg: CEConfig, weights: bool = True):
+    return _build_pretrained(cfg, weights) if cfg.backbone else _build_model(cfg)
+
+
+def _batch(inputs, idx, cfg: CEConfig, device: str):
+    import torch
+    if isinstance(inputs, PairText):
+        enc = _tokenizer(cfg)(list(inputs.a[idx]), list(inputs.b[idx]), truncation=True, max_length=cfg.max_len,
+                              padding=True, return_tensors="pt")
+        return {k: v.to(device) for k, v in enc.items() if k in ("input_ids", "attention_mask", "token_type_ids")}
+    return torch.as_tensor(inputs[idx].astype(np.int64), device=device)
+
+
+def _call(model, xb):
+    return model(**xb) if isinstance(xb, dict) else model(xb)
+
+
+def train_model(X, y: np.ndarray, cfg: CEConfig, tag: str = "", X_val=None, y_val: Optional[np.ndarray] = None) -> bytes:
+    """Train one cross-encoder on assembled pairs (char matrix or PairText); returns the serialized
+    (fp16) state dict."""
     import torch
     device = torch_device()
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
-    model = _wrap(_build_model(cfg), device)
-    decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "tok" not in n and "pos" not in n and "seg" not in n]
-    no_decay = [p for n, p in model.named_parameters() if not (p.ndim >= 2 and "tok" not in n and "pos" not in n and "seg" not in n)]
+    model = _wrap(_new_model(cfg), device)
+    if cfg.backbone:                           # usual transformer recipe: no decay on biases / norms
+        decay = [p for n, p in model.named_parameters() if p.ndim >= 2]
+        no_decay = [p for n, p in model.named_parameters() if p.ndim < 2]
+    else:
+        decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "tok" not in n and "pos" not in n and "seg" not in n]
+        no_decay = [p for n, p in model.named_parameters() if not (p.ndim >= 2 and "tok" not in n and "pos" not in n and "seg" not in n)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": cfg.weight_decay},
                              {"params": no_decay, "weight_decay": 0.0}], lr=cfg.lr, betas=(0.9, 0.98))
     n = len(y)
@@ -241,10 +340,10 @@ def train_model(X: np.ndarray, y: np.ndarray, cfg: CEConfig, tag: str = "",
             perm, pos = rng.permutation(n), 0
         idx = np.sort(perm[pos:pos + bs])
         pos += bs
-        xb = torch.as_tensor(X[idx].astype(np.int64), device=device)
+        xb = _batch(X, idx, cfg, device)
         yb = torch.as_tensor(yt[idx], device=device)
         with torch.autocast(device_type="cuda" if use_amp else "cpu", dtype=torch.float16, enabled=use_amp):
-            logit = model(xb)
+            logit = _call(model, xb)
         loss = lossf(logit.float(), yb)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -259,7 +358,10 @@ def train_model(X: np.ndarray, y: np.ndarray, cfg: CEConfig, tag: str = "",
         if (s + 1) % max(1, steps // 10) == 0 or s == steps - 1:
             LOG.info("  CE%s step %d/%d  loss %.4f  (%.0f pairs/s)", tag, s + 1, steps, run, seen / (time.time() - t0))
     blob = io.BytesIO()
-    torch.save(_unwrap(model).state_dict(), blob)
+    torch.save({k: (v.half() if v.is_floating_point() else v) for k, v in _unwrap(model).state_dict().items()}, blob)
+    del model, opt
+    if device == "cuda":
+        torch.cuda.empty_cache()
     out = blob.getvalue()
     if X_val is not None and len(X_val):
         from sklearn.metrics import log_loss, roc_auc_score
@@ -276,29 +378,32 @@ def _load(blob: bytes, cfg: CEConfig, device: str):
     import torch
     key = id(blob)
     if key not in _MODEL_CACHE:
-        m = _build_model(cfg)
-        m.load_state_dict(torch.load(io.BytesIO(blob), map_location="cpu"))
+        m = _new_model(cfg, weights=False)
+        m.load_state_dict(torch.load(io.BytesIO(blob), map_location="cpu"))     # fp16 -> fp32 on copy
         m.eval()
         _MODEL_CACHE[key] = _wrap(m, device)
     return _MODEL_CACHE[key]
 
 
-def predict_logits(blobs: List[bytes], X: np.ndarray, cfg: CEConfig, batch: int = 4096) -> np.ndarray:
-    """Mean logit of the given models over the assembled pair matrix X."""
+def predict_logits(blobs: List[bytes], X, cfg: CEConfig, batch: int = 4096) -> np.ndarray:
+    """Mean logit of the given models over the assembled pairs X (char matrix or PairText)."""
     import torch
     device = torch_device()
     out = np.zeros(len(X), dtype=np.float32)
     if len(X) == 0 or not blobs:
         return out
     use_amp = device == "cuda"
-    batch = batch if device == "cuda" else 256
+    if cfg.backbone:
+        batch = 512 if device == "cuda" else 32
+    else:
+        batch = batch if device == "cuda" else 256
     for blob in blobs:
         m = _load(blob, cfg, device)
         with torch.inference_mode():
             for a in range(0, len(X), batch):
-                xb = torch.as_tensor(X[a:a + batch].astype(np.int64), device=device)
+                xb = _batch(X, np.arange(a, min(a + batch, len(X))), cfg, device)
                 with torch.autocast(device_type="cuda" if use_amp else "cpu", dtype=torch.float16, enabled=use_amp):
-                    out[a:a + batch] += m(xb).float().cpu().numpy()
+                    out[a:a + batch] += _call(m, xb).float().cpu().numpy()
     return out / len(blobs)
 
 

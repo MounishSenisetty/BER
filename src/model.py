@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from .utils import LOG
+from .utils import cpu_limit, LOG
 
 
 @lru_cache(maxsize=1)
@@ -55,7 +55,7 @@ def _xgb_params(cfg) -> Dict:
         "grow_policy": "lossguide", "max_leaves": p.get("num_leaves", 127), "max_depth": 0,
         "min_child_weight": 5, "subsample": p.get("bagging_fraction", 0.8),
         "colsample_bytree": p.get("feature_fraction", 0.8), "lambda": p.get("lambda_l2", 1.0),
-        "max_bin": p.get("max_bin", 127), "seed": cfg.seed, "nthread": os.cpu_count() or 1,
+        "max_bin": p.get("max_bin", 127), "seed": cfg.seed, "nthread": cpu_limit(),
     }
 
 
@@ -74,13 +74,67 @@ def train_fold(backend: str, cfg, Xtr: pd.DataFrame, ytr, Xva: pd.DataFrame, yva
                             "split": [weight.get(f, 0.0) for f in Xtr.columns]})
         return ("xgboost", bytes(b.save_raw("json")), best), pred, imp
     import lightgbm as lgb
-    params = dict(cfg.params, seed=cfg.seed, num_threads=os.cpu_count() or 1)
+    params = dict(cfg.params, seed=cfg.seed, num_threads=cpu_limit())
     dtr = lgb.Dataset(Xtr, ytr, free_raw_data=True)
     dva = lgb.Dataset(Xva, yva, reference=dtr)
     b = lgb.train(params, dtr, cfg.num_boost_round, valid_sets=[dva],
                   callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False), lgb.log_evaluation(0)])
     pred = b.predict(Xva, num_iteration=b.best_iteration)
     imp = pd.DataFrame({"feature": Xtr.columns, "gain": b.feature_importance("gain"),
+                        "split": b.feature_importance("split")})
+    return ("lightgbm", b.model_to_string(num_iteration=b.best_iteration), b.best_iteration), pred, imp
+
+
+def train_fold_idx(backend: str, cfg, X: np.ndarray, y: np.ndarray, tr: np.ndarray, va: np.ndarray,
+                   features: List[str]) -> Tuple[Tuple, np.ndarray, pd.DataFrame]:
+    """train_fold on row indices of one big float32 matrix, without materialising the fold's
+    train / valid copies (the full training matrix alone is ~4 GB on the competition data).
+    XGBoost streams the rows through a DataIter into a QuantileDMatrix; LightGBM bins the whole
+    matrix once and takes Dataset.subset views."""
+    y = np.asarray(y, dtype=np.float32)
+    if backend == "xgboost":
+        import xgboost as xgb
+
+        class Rows(xgb.DataIter):
+            def __init__(self, idx, block=1_000_000):
+                self.idx, self.block, self.i = idx, block, 0
+                super().__init__()
+
+            def next(self, input_data):
+                if self.i >= len(self.idx):
+                    return False
+                sl = self.idx[self.i:self.i + self.block]
+                input_data(data=X[sl], label=y[sl], feature_names=features)
+                self.i += self.block
+                return True
+
+            def reset(self):
+                self.i = 0
+
+        mb = _xgb_params(cfg)["max_bin"]
+        dtr = xgb.QuantileDMatrix(Rows(tr), max_bin=mb)
+        dva = xgb.QuantileDMatrix(Rows(va), ref=dtr, max_bin=mb)
+        b = xgb.train(_xgb_params(cfg), dtr, cfg.num_boost_round, evals=[(dva, "valid")],
+                      early_stopping_rounds=cfg.early_stopping_rounds, verbose_eval=False)
+        best = int(b.best_iteration) + 1
+        pred = b.predict(dva, iteration_range=(0, best))
+        del dtr, dva
+        gain, weight = b.get_score(importance_type="total_gain"), b.get_score(importance_type="weight")
+        imp = pd.DataFrame({"feature": features, "gain": [gain.get(f, 0.0) for f in features],
+                            "split": [weight.get(f, 0.0) for f in features]})
+        return ("xgboost", bytes(b.save_raw("json")), best), pred, imp
+    import lightgbm as lgb
+    params = dict(cfg.params, seed=cfg.seed, num_threads=cpu_limit())
+    full = lgb.Dataset(X, y, feature_name=features, free_raw_data=False,
+                       params={"max_bin": params.get("max_bin", 255), "verbose": -1}).construct()
+    dtr, dva = full.subset(np.sort(tr)), full.subset(np.sort(va))
+    b = lgb.train(params, dtr, cfg.num_boost_round, valid_sets=[dva],
+                  callbacks=[lgb.early_stopping(cfg.early_stopping_rounds, verbose=False), lgb.log_evaluation(0)])
+    pred = np.empty(len(va))
+    for a in range(0, len(va), 1_000_000):
+        sl = va[a:a + 1_000_000]
+        pred[a:a + len(sl)] = b.predict(X[sl], num_iteration=b.best_iteration)
+    imp = pd.DataFrame({"feature": features, "gain": b.feature_importance("gain"),
                         "split": b.feature_importance("split")})
     return ("lightgbm", b.model_to_string(num_iteration=b.best_iteration), b.best_iteration), pred, imp
 
@@ -98,7 +152,7 @@ class Ensemble:
                 import xgboost as xgb
                 b = xgb.Booster()
                 b.load_model(bytearray(blob))
-                b.set_param({"device": "cuda" if _xgb_cuda() else "cpu", "nthread": os.cpu_count() or 1})
+                b.set_param({"device": "cuda" if _xgb_cuda() else "cpu", "nthread": cpu_limit()})
                 self.parts.append((kind, b, best))
             else:
                 import lightgbm as lgb

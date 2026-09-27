@@ -33,7 +33,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 from rapidfuzz.distance import Indel, JaroWinkler
 
-from .utils import LOG
+from .utils import cpu_limit, LOG
 
 _RE_INDIC = re.compile("[ऀ-෿]")
 _RE_SPLIT = re.compile(r"[\s,.;:()\[\]{}/\\\-&'\"|#@*<>_!?+=]+")
@@ -147,7 +147,7 @@ def learn_lexicon(pairs_rec: Sequence[str], pairs_s1: Sequence[str], pairs_ent: 
     s1 = [pairs_s1[i] for i in idx]
     ent = np.asarray(pairs_ent)[idx]
     jobs = [(rec[i:i + block], s1[i:i + block], ent[i:i + block], min_sim) for i in range(0, len(rec), block)]
-    n_jobs = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else n_jobs
+    n_jobs = cpu_limit() if n_jobs is None or n_jobs < 1 else n_jobs
     if n_jobs > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=min(n_jobs, len(jobs))) as ex:
             parts = list(ex.map(_mine, jobs))
