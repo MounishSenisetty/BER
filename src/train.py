@@ -129,6 +129,8 @@ def main():
     ap.add_argument("--ce-epochs", type=float, default=None)
     ap.add_argument("--ce-max-train-pairs", type=int, default=None)
     ap.add_argument("--ce-small", action="store_true", help="tiny cross-encoder (CPU smoke tests)")
+    ap.add_argument("--final", choices=["auto", "stage1", "stage2", "stage2+ce"], default="auto",
+                    help="model variant to ship (auto = best nested-CV macro F0.5)")
     args = ap.parse_args()
     setup_logging()
     os.makedirs(args.model_dir, exist_ok=True)
@@ -336,6 +338,7 @@ def main():
     ev1 = evaluate(oof, "stage1")
     final, final_prob, s2_models, s2_features, ev2 = ev1, oof, None, None, None
     variant_scores = {"stage1": ev1["nested"]}
+    cands = {"stage1": (ev1, oof, None, None, False)}
     s2_uses_ce, ce_blobs = False, None
 
     # ------------------------------------------------------------ stage 2 (competitor-aware re-scoring)
@@ -399,18 +402,17 @@ def main():
                 LOG.info("[%s] top features:\n%s", tag, imp2.sort_values("gain", ascending=False).head(12).to_string(index=False))
             ev = evaluate(oof2, tag)
             variant_scores[tag] = ev["nested"]
-            if ev["nested"] > final["nested"]:
-                final, final_prob = ev, oof2
-                s2_models, s2_features = models2, list(X2.columns)
-                s2_uses_ce = ce is not None
+            cands[tag] = (ev, oof2, models2, list(X2.columns), ce is not None)
             if ev2 is None or ev["nested"] > ev2["nested"]:
                 ev2 = ev
             del X2
         del all_s1, all_rec, all_p, raw, rs, ss, c_s1, c_rec, c_p, c_raw
-        if s2_models is None:
-            LOG.info("Stage 2 did not beat stage 1 on nested CV -> keeping stage 1")
-        if not s2_uses_ce:
-            ce_blobs = None
+    pick = max(cands, key=lambda k: cands[k][0]["nested"]) if args.final == "auto" else args.final
+    if pick not in cands:
+        raise SystemExit(f"--final {pick}: that variant was not trained (available: {sorted(cands)})")
+    final, final_prob, s2_models, s2_features, s2_uses_ce = cands[pick]
+    if not s2_uses_ce:
+        ce_blobs = None
     best, sel, tuned, nested_score, nested = (final["best"], final["sel"], final["tuned"], final["nested"],
                                               final["nested_per_fold"])
     final["curve"].to_csv(os.path.join(args.model_dir, "threshold_curve.csv"), index=False)
