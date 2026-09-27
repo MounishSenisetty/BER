@@ -166,3 +166,14 @@ def thin_source1(split: Split, frac: float, seed: int) -> Split:
     LOG.info("S1 dropout: kept %d of %d Source 1 entities; %d matched records became distractors",
              len(s1), len(split.s1), n_dist)
     return Split(s1, split.rec, truth, split.gt_header)
+
+
+def restrict_countries(split: Split, countries) -> Split:
+    """Keep only the given (lower-cased) country labels -- for quick single-country experiments."""
+    k1 = split.s1["country"].map(country_key).isin(countries).to_numpy()
+    k2 = split.rec["country"].map(country_key).isin(countries).to_numpy()
+    s1 = split.s1[k1].reset_index(drop=True)
+    kept = set(s1["id"])
+    truth = {k: v for k, v in split.truth.items() if k in kept} if split.truth is not None else None
+    LOG.info("Countries %s: %d Source 1 rows, %d records", sorted(countries), len(s1), int(k2.sum()))
+    return Split(s1, split.rec[k2].reset_index(drop=True), truth, split.gt_header)

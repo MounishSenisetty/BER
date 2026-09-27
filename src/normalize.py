@@ -254,7 +254,25 @@ IN_STATES = {
     "uttar pradesh": "up", "madhy pradesh": "mp", "tamil naadu": "tn", "tamizh naadu": "tn",
     "pashchim bangal": "wb", "haryaana": "hr", "bihaar": "br", "telangaan": "ts",
 }
-_STATE_TABLES = {"us": US_STATES, "usa": US_STATES, "united states": US_STATES, "india": IN_STATES}
+# France: records name either the region or the department ("Hauts-de-France" vs "Nord" / "Pas-de-Calais"),
+# so both map to one region code (keys are in clean() form: accents folded, hyphens -> spaces)
+FR_REGIONS = {
+    "hauts de france": "hdf", "nord": "hdf", "pas de calais": "hdf", "somme": "hdf", "aisne": "hdf", "oise": "hdf",
+    "nouvelle aquitaine": "naq", "gironde": "naq", "landes": "naq", "pyrenees atlantiques": "naq",
+    "dordogne": "naq", "charente maritime": "naq", "charente": "naq", "lot et garonne": "naq",
+    "pays de la loire": "pdl", "loire atlantique": "pdl", "vendee": "pdl", "maine et loire": "pdl",
+    "sarthe": "pdl", "mayenne": "pdl",
+    "ile de france": "idf", "paris": "idf", "hauts de seine": "idf", "seine saint denis": "idf",
+    "val de marne": "idf", "yvelines": "idf", "essonne": "idf", "val d oise": "idf", "seine et marne": "idf",
+    "auvergne rhone alpes": "ara", "rhone": "ara", "isere": "ara", "provence alpes cote d azur": "pac",
+    "bouches du rhone": "pac", "alpes maritimes": "pac", "var": "pac", "occitanie": "occ", "haute garonne": "occ",
+    "herault": "occ", "grand est": "ges", "bas rhin": "ges", "haut rhin": "ges", "moselle": "ges",
+    "bretagne": "bre", "ille et vilaine": "bre", "finistere": "bre", "morbihan": "bre", "cotes d armor": "bre",
+    "normandie": "nor", "seine maritime": "nor", "calvados": "nor", "centre val de loire": "cvl", "loiret": "cvl",
+    "bourgogne franche comte": "bfc", "cote d or": "bfc", "doubs": "bfc", "corse": "cor",
+}
+_STATE_TABLES = {"us": US_STATES, "usa": US_STATES, "united states": US_STATES, "india": IN_STATES,
+                 "france": FR_REGIONS}
 
 
 def _phrase_regex(table: Dict[str, str]):
@@ -564,6 +582,8 @@ def _prep_one(name: str, address: str, country: str):
     nt = [t for t in tokens(_RE_LEET.sub(_unleet, name or ""), ckey) if t not in WEB_TOKENS]
     if len(nt) > 2 and nt[0] == "m" and nt[1] == "s":            # "M/s Foo Traders"
         nt = nt[2:]
+    if ckey and len(nt) > 1 and ckey in nt:                     # "Unite (France) Sante", "SKC (India) Pvt Ltd"
+        nt = [t for t in nt if t != ckey] or nt
     drop = HONORIFICS | ({"pra", "li"} if ckey == "india" else set())    # India: "प्रा. लि." = Pvt. Ltd.
     legal = [is_legal(t) or t in drop for t in nt]      # before phonetics mangle typos ("lximited")
     keep = _peel_legal_edges(nt, legal, fr=ckey == "france")

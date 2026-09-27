@@ -22,6 +22,16 @@ automatically from the test split's row counts).
 - Strategy: [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Methodology write-up: [`Documentation_template.md`](Documentation_template.md)
 
+**Kaggle (GPU):** [`notebooks/kaggle_gpu.ipynb`](notebooks/kaggle_gpu.ipynb). Its cells clone this
+branch, install the extra packages, locate the dataset, train, run inference, validate and package the
+submission.
+
+**How high can the score go?** On the training split, 39.6 % of Source 1 names are shared by more
+than one entity, and 4.4 % of matched records have no address. A record with no address whose
+owner's name belongs to several entities cannot be attributed from its content. Those records
+alone cap macro F0.5 at about **0.995** for any method (exact name copies alone cost 0.0011); see
+`scripts/upper_bound.py`.
+
 ## Reproduce end-to-end
 
 ```bash
